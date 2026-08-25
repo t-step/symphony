@@ -42,6 +42,24 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  The structural (restart-only) configuration selection captured once at
+  process start — currently `tracker.kind` (IV-005; research.md R9). Never
+  reflects a later `WORKFLOW.md` edit until the next restart. Later tasks add
+  `tracker.provider.path` (once `tracker.kind: local` is a registered
+  adapter) and `agent_execution.kind` (once that field exists) to this map.
+  """
+  @spec structural_settings!() :: map()
+  def structural_settings! do
+    case WorkflowStore.structural_settings() do
+      {:ok, structural} ->
+        structural
+
+      {:error, reason} ->
+        raise ArgumentError, message: format_config_error(reason)
+    end
+  end
+
   @spec max_concurrent_agents_for_state(term()) :: pos_integer()
   def max_concurrent_agents_for_state(state_name) when is_binary(state_name) do
     config = settings!()
@@ -88,8 +106,11 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec local_workspace_root() :: Path.t()
   def local_workspace_root do
-    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
-    Path.expand(settings!().workspace.root, workflow_dir)
+    Path.expand(settings!().workspace.root, workflow_dir())
+  end
+
+  defp workflow_dir do
+    Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
   end
 
   @spec validate!() :: :ok | {:error, term()}

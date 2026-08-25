@@ -15,7 +15,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow, :settings]
+    defstruct [:path, :stamp, :workflow, :settings, :structural]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -62,12 +62,30 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  @doc """
+  Returns the structural (restart-only) configuration selection captured once
+  at process start, unaffected by any later `WORKFLOW.md` reload (IV-005).
+  """
+  @spec structural_settings() :: {:ok, map()} | {:error, term()}
+  def structural_settings do
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) ->
+        GenServer.call(__MODULE__, :structural_settings)
+
+      _ ->
+        case load_state(Workflow.workflow_file_path()) do
+          {:ok, %State{settings: settings}} -> {:ok, compute_structural(settings)}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
   @impl true
   def init(_opts) do
     case load_state(Workflow.workflow_file_path()) do
       {:ok, state} ->
         schedule_poll()
-        {:ok, state}
+        {:ok, %{state | structural: compute_structural(state.settings)}}
 
       {:error, reason} ->
         {:stop, reason}
@@ -105,6 +123,10 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  def handle_call(:structural_settings, _from, %State{structural: structural} = state) do
+    {:reply, {:ok, structural}, state}
+  end
+
   @impl true
   def handle_info(:poll, %State{} = state) do
     schedule_poll()
@@ -132,7 +154,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defp reload_path(path, state) do
     case load_state(path) do
       {:ok, new_state} ->
-        {:ok, new_state}
+        {:ok, %{new_state | structural: state.structural}}
 
       {:error, reason} ->
         log_reload_error(path, reason)
@@ -177,5 +199,14 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp log_reload_error(path, reason) do
     Logger.error("Failed to reload workflow path=#{path} reason=#{inspect(reason)}; keeping last known good configuration")
+  end
+
+  # Structural (restart-only) selections, per IV-005/research.md R9/R9a. Computed once at
+  # process start (`init/1`) and preserved unchanged across every later reload (`reload_path/2`)
+  # regardless of how many times `WORKFLOW.md` changes afterward. `tracker_provider_path` (only
+  # meaningful once `tracker.kind: local` is a registered adapter) and `agent_execution_kind` are
+  # added to this map by later tasks as their prerequisite fields/adapters land.
+  defp compute_structural(%Schema{} = settings) do
+    %{tracker_kind: settings.tracker.kind}
   end
 end

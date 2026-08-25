@@ -50,9 +50,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       tracker_project_slug: "session-project"
     )
 
+    restart_workflow_store!()
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    restart_workflow_store!()
     assert BoundDynamicTool.bind().tool_specs == []
 
     test_pid = self()

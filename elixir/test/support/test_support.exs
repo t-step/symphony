@@ -22,7 +22,13 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0,
+          restart_workflow_store!: 0
+        ]
 
       setup do
         workflow_root =
@@ -35,7 +41,7 @@ defmodule SymphonyElixir.TestSupport do
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
-        if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+        restart_workflow_store!()
         stop_default_http_server()
 
         on_exit(fn ->
@@ -67,6 +73,38 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  @doc """
+  Simulates a Symphony process restart for tests that need a structural
+  (restart-only) config selection — `tracker.kind`, `tracker.provider.path`
+  when local, `agent_execution.kind` — captured by `WorkflowStore` at its own
+  `init/1` to reflect the currently-written `WORKFLOW.md`, per IV-005.
+  `write_workflow_file!/2` alone (via `force_reload/0`) intentionally does NOT
+  do this, since an ordinary live reload must not treat structural fields as
+  changed until an actual restart.
+  """
+  def restart_workflow_store! do
+    case Process.whereis(SymphonyElixir.WorkflowStore) do
+      pid when is_pid(pid) ->
+        ref = Process.monitor(pid)
+        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+        after
+          1_000 -> :ok
+        end
+
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore) do
+          {:ok, _pid} -> :ok
+          {:ok, _pid, _info} -> :ok
+          {:error, reason} -> raise "Failed to restart WorkflowStore in test: #{inspect(reason)}"
+        end
+
+      nil ->
+        :ok
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn

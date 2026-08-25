@@ -204,6 +204,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, %{id: "ignored"}])
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    restart_workflow_store!()
 
     assert Config.settings!().tracker.kind == "memory"
     assert SymphonyElixir.Tracker.adapter() == Memory
@@ -223,6 +224,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              SymphonyElixir.Tracker.adapter_for_kind("future-tracker")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+    restart_workflow_store!()
     assert SymphonyElixir.Tracker.adapter() == Adapter
     assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
   end

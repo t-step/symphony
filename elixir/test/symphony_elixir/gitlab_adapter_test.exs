@@ -425,6 +425,7 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
     on_exit(fn -> restore_env(token_env, previous_token) end)
 
     write_gitlab_workflow!(Workflow.workflow_file_path(), "$#{token_env}")
+    restart_workflow_store!()
 
     binding = Tracker.bind_agent_tools()
 

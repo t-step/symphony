@@ -402,6 +402,7 @@ defmodule SymphonyElixir.CoreTest do
       hook_timeout_ms: 60_000
     )
 
+    restart_workflow_store!()
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
     assert {:ok, runtime_supervisor_pid} =
@@ -702,6 +703,7 @@ defmodule SymphonyElixir.CoreTest do
         poll_interval_ms: 30_000
       )
 
+      restart_workflow_store!()
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
       orchestrator_name = Module.concat(__MODULE__, :MissingRunningIssueOrchestrator)
@@ -969,6 +971,7 @@ defmodule SymphonyElixir.CoreTest do
         hook_before_run: "exit 1"
       )
 
+      restart_workflow_store!()
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
       {:ok, task_supervisor} = Task.Supervisor.start_link()
 

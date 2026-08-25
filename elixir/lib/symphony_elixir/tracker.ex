@@ -48,13 +48,13 @@ defmodule SymphonyElixir.Tracker do
   @spec bind_agent_tools() :: map()
   def bind_agent_tools do
     tracker_settings = Config.settings!().tracker
-    adapter = adapter_for_settings!(tracker_settings)
+    bound_adapter = adapter()
 
     %{
-      adapter: adapter,
+      adapter: bound_adapter,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
-      secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
+      tool_specs: adapter_agent_tool_specs(bound_adapter),
+      secret_environment_names: adapter_secret_environment_names(bound_adapter, tracker_settings)
     }
   end
 
@@ -84,10 +84,15 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
+  @doc """
+  Resolves the active tracker adapter module from the structural (restart-only)
+  `tracker.kind` selection (IV-005; research.md R9), not from a live-reloaded
+  read of `WORKFLOW.md`.
+  """
   @spec adapter() :: module()
   def adapter do
-    Config.settings!().tracker
-    |> adapter_for_settings!()
+    {:ok, resolved_adapter} = adapter_for_kind(Config.structural_settings!().tracker_kind)
+    resolved_adapter
   end
 
   @spec adapter_for_kind(String.t()) :: {:ok, module()} | {:error, term()}
@@ -96,11 +101,6 @@ defmodule SymphonyElixir.Tracker do
       {:ok, adapter} -> {:ok, adapter}
       :error -> {:error, {:unsupported_tracker_kind, kind}}
     end
-  end
-
-  defp adapter_for_settings!(%{kind: kind}) do
-    {:ok, adapter} = adapter_for_kind(kind)
-    adapter
   end
 
   defp adapter_agent_tool_specs(adapter) do
