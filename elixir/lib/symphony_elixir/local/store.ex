@@ -109,6 +109,35 @@ defmodule SymphonyElixir.Local.Store do
     end
   end
 
+  @doc """
+  Evaluates research.md R2's decision table against `data_path` directly, without requiring a
+  running `Local.Store` process. Used by `Local.Adapter.validate_config/1`, which must be callable
+  before (or without) the singleton `Local.Store` GenServer being started — e.g. during
+  `WorkflowStore.init/1`'s own settings validation, which happens before that structural pin (and
+  therefore the singleton it starts) exists. Never writes either file. This is the same decision
+  logic the GenServer's `read/1` callback applies; both share this one implementation.
+  """
+  @spec evaluate(Path.t()) :: {:ok, %{format_version: 1, issues: map()}} | {:error, read_error()}
+  def evaluate(data_path) do
+    case marker_state(marker_path(data_path)) do
+      :absent ->
+        case read_data_file(data_path) do
+          :absent -> {:error, :local_tracker_not_initialized}
+          _present_valid_or_invalid -> {:error, {:local_tracker_ambiguous_state, :marker_missing}}
+        end
+
+      {:unreadable, reason} ->
+        {:error, {:local_tracker_corrupt, {:marker_unreadable, reason}}}
+
+      :present ->
+        case read_data_file(data_path) do
+          :absent -> {:error, {:local_tracker_corrupt, :missing_after_established}}
+          {:ok, parsed} -> {:ok, parsed}
+          {:error, reason} -> {:error, {:local_tracker_corrupt, reason}}
+        end
+    end
+  end
+
   ## GenServer callbacks
 
   @impl true
@@ -127,25 +156,7 @@ defmodule SymphonyElixir.Local.Store do
 
   ## Read path (research.md R2's decision table) — never writes.
 
-  defp do_read(%__MODULE__{data_path: data_path, marker_path: marker_path}) do
-    case marker_state(marker_path) do
-      :absent ->
-        case read_data_file(data_path) do
-          :absent -> {:error, :local_tracker_not_initialized}
-          _present_valid_or_invalid -> {:error, {:local_tracker_ambiguous_state, :marker_missing}}
-        end
-
-      {:unreadable, reason} ->
-        {:error, {:local_tracker_corrupt, {:marker_unreadable, reason}}}
-
-      :present ->
-        case read_data_file(data_path) do
-          :absent -> {:error, {:local_tracker_corrupt, :missing_after_established}}
-          {:ok, parsed} -> {:ok, parsed}
-          {:error, reason} -> {:error, {:local_tracker_corrupt, reason}}
-        end
-    end
-  end
+  defp do_read(%__MODULE__{data_path: data_path}), do: evaluate(data_path)
 
   ## The one ongoing lifecycle write. Only ever reaches the data file, never the marker; only ever
   ## runs from an already-established read (never completes/creates establishment itself).

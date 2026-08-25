@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Local.Init, as: LocalInit
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -1170,6 +1172,119 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = state.blocked[issue_id]
   end
 
+  describe "local tracker post-start source failures (FR-008.3/FR-013)" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "symphony-orch-local-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      data_path = Path.join(dir, "local_tracker.json")
+
+      on_exit(fn ->
+        File.chmod(data_path, 0o644)
+        File.rm_rf(dir)
+      end)
+
+      assert {:ok, :initialized} = LocalInit.run(data_path)
+      seed_local_issue(data_path, "1", "todo")
+
+      write_local_tracker_workflow!(Workflow.workflow_file_path(), data_path)
+      restart_workflow_store!()
+
+      %{data_path: data_path}
+    end
+
+    test "established data deleted after startup skips the tick, undisturbs the running attempt, and never auto-fails it", %{
+      data_path: data_path
+    } do
+      orchestrator_name = Module.concat(__MODULE__, :LocalEstablishedLossOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+      running_entry = running_entry_for(%Issue{id: "1", identifier: "LOC-1", state: "todo"})
+
+      :sys.replace_state(pid, fn state ->
+        state
+        |> Map.put(:running, %{"1" => running_entry})
+        |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
+      end)
+
+      File.rm!(data_path)
+
+      log =
+        capture_log([level: :debug], fn ->
+          send(pid, :run_poll_cycle)
+          Process.sleep(50)
+        end)
+
+      assert log =~ "Failed to refresh running issue states" or log =~ "local_tracker_corrupt"
+
+      state_after = :sys.get_state(pid)
+      assert %{"1" => ^running_entry} = state_after.running
+      refute Map.has_key?(state_after.retry_attempts, "1")
+      refute MapSet.member?(state_after.completed, "1")
+    end
+
+    test "established data corrupted after startup is skipped and retried the same way, without crashing", %{
+      data_path: data_path
+    } do
+      orchestrator_name = Module.concat(__MODULE__, :LocalCorruptOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+      running_entry = running_entry_for(%Issue{id: "1", identifier: "LOC-1", state: "todo"})
+
+      :sys.replace_state(pid, fn state ->
+        state
+        |> Map.put(:running, %{"1" => running_entry})
+        |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
+      end)
+
+      File.write!(data_path, "{not json")
+
+      send(pid, :run_poll_cycle)
+      Process.sleep(50)
+
+      assert Process.alive?(pid)
+      state_after = :sys.get_state(pid)
+      assert %{"1" => ^running_entry} = state_after.running
+    end
+
+    test "a transient, self-resolving read failure is tolerated the same way and recovers on the next tick", %{
+      data_path: data_path
+    } do
+      orchestrator_name = Module.concat(__MODULE__, :LocalTransientOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+      running_entry = running_entry_for(%Issue{id: "1", identifier: "LOC-1", state: "todo"})
+
+      :sys.replace_state(pid, fn state ->
+        state
+        |> Map.put(:running, %{"1" => running_entry})
+        |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
+      end)
+
+      File.chmod!(data_path, 0o000)
+
+      send(pid, :run_poll_cycle)
+      Process.sleep(50)
+
+      mid_state = :sys.get_state(pid)
+      assert %{"1" => ^running_entry} = mid_state.running
+
+      File.chmod!(data_path, 0o644)
+
+      send(pid, :run_poll_cycle)
+      Process.sleep(50)
+
+      state_after = :sys.get_state(pid)
+      assert %{"1" => recovered_entry} = state_after.running
+      assert recovered_entry.pid == running_entry.pid
+      assert recovered_entry.ref == running_entry.ref
+      refute Map.has_key?(state_after.retry_attempts, "1")
+      refute MapSet.member?(state_after.completed, "1")
+    end
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
@@ -1799,5 +1914,44 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp seed_local_issue(data_path, id, state) do
+    File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{id => %{"state" => state}}}))
+  end
+
+  defp write_local_tracker_workflow!(path, data_path) do
+    File.write!(
+      path,
+      """
+      ---
+      tracker:
+        kind: local
+        provider:
+          path: #{Jason.encode!(data_path)}
+        active_states: ["todo", "in_progress", "blocked"]
+        terminal_states: ["done", "cancelled"]
+      codex:
+        command: codex app-server
+      ---
+
+      Resolve the assigned work item.
+      """
+    )
+  end
+
+  defp running_entry_for(%Issue{} = issue) do
+    %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
   end
 end

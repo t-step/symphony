@@ -109,7 +109,12 @@ defmodule SymphonyElixir.Config do
     Path.expand(settings!().workspace.root, workflow_dir())
   end
 
-  defp workflow_dir do
+  @doc """
+  The directory containing the currently active `WORKFLOW.md`, used to resolve paths declared
+  relative to it (`workspace.root`, and — for `tracker.kind: local` — `tracker.provider.path`).
+  """
+  @spec workflow_dir() :: Path.t()
+  def workflow_dir do
     Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
   end
 

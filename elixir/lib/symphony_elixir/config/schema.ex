@@ -11,6 +11,9 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @local_default_provider_path ".symphony/local_tracker.json"
+  @local_active_states ["todo", "in_progress", "blocked"]
+  @local_terminal_states ["done", "cancelled"]
 
   @type t :: %__MODULE__{}
 
@@ -417,43 +420,9 @@ defmodule SymphonyElixir.Config.Schema do
     effective_kind = effective_tracker_kind(structural_tracker_kind, settings.tracker.kind)
 
     {api_key, assignee, provider, secret_environment_names} =
-      case effective_kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
+      resolve_tracker_provider(effective_kind, settings, provider)
 
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case effective_kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {active_states, terminal_states} = resolve_tracker_states(effective_kind, settings)
 
     tracker = %{
       settings.tracker
@@ -483,6 +452,58 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp effective_tracker_kind(nil, live_kind), do: live_kind
   defp effective_tracker_kind(structural_tracker_kind, _live_kind), do: structural_tracker_kind
+
+  defp resolve_tracker_provider("linear", settings, provider) do
+    linear_provider =
+      provider
+      |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
+      |> Map.put_new("api_key", settings.tracker.api_key)
+      |> Map.put_new("project_slug", settings.tracker.project_slug)
+      |> Map.put_new("assignee", settings.tracker.assignee)
+
+    resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+    resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+    {
+      resolved_api_key,
+      resolved_assignee,
+      linear_provider,
+      ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+    }
+  end
+
+  defp resolve_tracker_provider("local", settings, provider) do
+    local_provider =
+      Map.put(
+        provider,
+        "path",
+        resolve_path_value(provider["path"] || @local_default_provider_path, @local_default_provider_path)
+      )
+
+    {settings.tracker.api_key, settings.tracker.assignee, local_provider, []}
+  end
+
+  defp resolve_tracker_provider(_effective_kind, settings, provider) do
+    {settings.tracker.api_key, settings.tracker.assignee, provider, []}
+  end
+
+  defp resolve_tracker_states(kind, settings) when kind in ["linear", "memory"] do
+    {
+      settings.tracker.active_states || @linear_active_states,
+      settings.tracker.terminal_states || @linear_terminal_states
+    }
+  end
+
+  defp resolve_tracker_states("local", settings) do
+    {
+      settings.tracker.active_states || @local_active_states,
+      settings.tracker.terminal_states || @local_terminal_states
+    }
+  end
+
+  defp resolve_tracker_states(_effective_kind, settings) do
+    {settings.tracker.active_states, settings.tracker.terminal_states}
+  end
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

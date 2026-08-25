@@ -2,6 +2,8 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Linear.Adapter, as: LinearAdapter
+  alias SymphonyElixir.Local.Adapter, as: LocalAdapter
+  alias SymphonyElixir.Local.Init, as: LocalInit
   alias SymphonyElixir.Tracker.Memory
 
   test "a live tracker.kind edit does not take effect until the WorkflowStore restarts" do
@@ -77,5 +79,77 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
 
     Workflow.set_workflow_file_path(existing_path)
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+  end
+
+  describe "tracker.provider.path restart-only pinning under tracker.kind: local (research.md R9a)" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "symphony-structural-local-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      store_a = Path.join(dir, "store_a.json")
+      store_b = Path.join(dir, "store_b.json")
+
+      assert {:ok, :initialized} = LocalInit.run(store_a)
+      File.write!(store_a, Jason.encode!(%{"format_version" => 1, "issues" => %{"a" => %{"state" => "todo"}}}))
+
+      assert {:ok, :initialized} = LocalInit.run(store_b)
+      File.write!(store_b, Jason.encode!(%{"format_version" => 1, "issues" => %{"b" => %{"state" => "todo"}}}))
+
+      %{store_a: store_a, store_b: store_b}
+    end
+
+    test "a live tracker.provider.path edit does not redirect reads until the WorkflowStore restarts", %{
+      store_a: store_a,
+      store_b: store_b
+    } do
+      write_local_workflow!(Workflow.workflow_file_path(), store_a)
+      restart_workflow_store!()
+
+      assert Config.structural_settings!().tracker_kind == "local"
+      assert Config.structural_settings!().tracker_provider_path == store_a
+      assert Tracker.adapter() == LocalAdapter
+      assert {:ok, [%{id: "a"}]} = Tracker.fetch_issues_by_ids(["a"])
+
+      write_local_workflow!(Workflow.workflow_file_path(), store_b)
+
+      assert Config.settings!().tracker.provider["path"] == store_b
+
+      assert Config.structural_settings!().tracker_provider_path == store_a,
+             "tracker.provider.path must stay pinned to the original resolved path until an actual restart"
+
+      assert {:ok, [%{id: "a"}]} = Tracker.fetch_issues_by_ids(["a"]),
+             "the pinned store must still be readable after a live path edit, not the new one"
+
+      assert {:ok, []} = Tracker.fetch_issues_by_ids(["b"]),
+             "the new path's data must not become visible mid-flight, before an actual restart"
+
+      restart_workflow_store!()
+
+      assert Config.structural_settings!().tracker_provider_path == store_b
+      assert Tracker.adapter() == LocalAdapter
+      assert {:ok, [%{id: "b"}]} = Tracker.fetch_issues_by_ids(["b"])
+      assert {:ok, []} = Tracker.fetch_issues_by_ids(["a"])
+    end
+
+    defp write_local_workflow!(path, data_path) do
+      File.write!(
+        path,
+        """
+        ---
+        tracker:
+          kind: local
+          provider:
+            path: #{Jason.encode!(data_path)}
+        ---
+
+        Resolve the assigned work item.
+        """
+      )
+
+      if Process.whereis(SymphonyElixir.WorkflowStore) do
+        assert :ok = SymphonyElixir.WorkflowStore.force_reload()
+      end
+    end
   end
 end

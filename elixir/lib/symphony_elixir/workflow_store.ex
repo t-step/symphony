@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorkflowStore do
 
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Local
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
@@ -73,8 +74,10 @@ defmodule SymphonyElixir.WorkflowStore do
         GenServer.call(__MODULE__, :structural_settings)
 
       _ ->
-        case load_state(Workflow.workflow_file_path()) do
-          {:ok, %State{settings: settings}} -> {:ok, compute_structural(settings)}
+        path = Workflow.workflow_file_path()
+
+        case load_state(path) do
+          {:ok, %State{settings: settings}} -> {:ok, compute_structural(settings, path)}
           {:error, reason} -> {:error, reason}
         end
     end
@@ -84,8 +87,10 @@ defmodule SymphonyElixir.WorkflowStore do
   def init(_opts) do
     case load_state(Workflow.workflow_file_path()) do
       {:ok, state} ->
+        structural = compute_structural(state.settings, state.path)
+        :ok = ensure_local_store(structural)
         schedule_poll()
-        {:ok, %{state | structural: compute_structural(state.settings)}}
+        {:ok, %{state | structural: structural}}
 
       {:error, reason} ->
         {:stop, reason}
@@ -208,10 +213,34 @@ defmodule SymphonyElixir.WorkflowStore do
 
   # Structural (restart-only) selections, per IV-005/research.md R9/R9a. Computed once at
   # process start (`init/1`) and preserved unchanged across every later reload (`reload_path/2`)
-  # regardless of how many times `WORKFLOW.md` changes afterward. `tracker_provider_path` (only
-  # meaningful once `tracker.kind: local` is a registered adapter) and `agent_execution_kind` are
-  # added to this map by later tasks as their prerequisite fields/adapters land.
-  defp compute_structural(%Schema{} = settings) do
+  # regardless of how many times `WORKFLOW.md` changes afterward. `agent_execution_kind` is added
+  # to this map by a later task as its prerequisite field lands.
+  defp compute_structural(%Schema{tracker: %{kind: "local"} = tracker} = _settings, path) do
+    workflow_dir = path |> Path.expand() |> Path.dirname()
+
+    %{
+      tracker_kind: tracker.kind,
+      tracker_provider_path: Local.Adapter.resolve_provider_path(tracker.provider, workflow_dir)
+    }
+  end
+
+  defp compute_structural(%Schema{} = settings, _path) do
     %{tracker_kind: settings.tracker.kind}
   end
+
+  # `Local.Store` is a named singleton, started only when `tracker.kind: local` is the active
+  # structural selection (research.md R1a) — and only here, at `WorkflowStore.init/1`, so its
+  # lifecycle is tied to the same restart boundary as the structural pin above (IV-005/research.md
+  # R9a): `start_link/1` links the new process to this GenServer, so a `WorkflowStore` restart
+  # (the only event that may change `tracker_provider_path`) always tears down and restarts
+  # `Local.Store` too, while an ordinary dynamic reload (`force_reload/0`, the poll tick) never
+  # touches it.
+  defp ensure_local_store(%{tracker_kind: "local", tracker_provider_path: path}) do
+    case Local.Store.start_link(path: path, name: Local.Store) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+  end
+
+  defp ensure_local_store(_structural), do: :ok
 end
