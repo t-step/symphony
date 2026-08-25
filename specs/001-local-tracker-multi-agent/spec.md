@@ -20,9 +20,9 @@ An engineering team maintaining the development fork wants to point Symphony at 
 
 **Acceptance Scenarios**:
 
-1. **Given** a local work source containing one dispatch-eligible work item, **When** Symphony's poll tick runs, **Then** Symphony creates a workspace and starts a coding-agent run for that item, applying the same dispatch-eligibility rules it applies to a hosted-tracker work item.
-2. **Given** a running coding-agent session backed by the local work source, **When** the session completes successfully, **Then** Symphony schedules the same continuation/retry check it schedules after any successful run; if the workflow directs a lifecycle-state mutation for that outcome, the local work source reflects it, and otherwise the work item remains active under Symphony's existing active-item continuation behavior, unchanged.
-3. **Given** no network access to any hosted tracker or hosted control-plane service, **When** Symphony operates entirely against the local work source, **Then** polling, dispatch, retries, and reconciliation continue to function without error.
+1. **Given** a local work-tracking source containing one dispatch-eligible work item, **When** Symphony's poll tick runs, **Then** Symphony creates a workspace and starts a coding-agent run for that item, applying the same dispatch-eligibility rules it applies to a hosted-tracker work item.
+2. **Given** a running coding-agent session backed by the local work-tracking source, **When** the session completes successfully, **Then** Symphony schedules the same continuation/retry check it schedules after any successful run; if the workflow directs a lifecycle-state mutation for that outcome, the local work-tracking source reflects it, and otherwise the work item remains active under Symphony's existing active-item continuation behavior, unchanged.
+3. **Given** no network access to any hosted tracker or hosted control-plane service, **When** Symphony operates entirely against the local work-tracking source, **Then** polling, dispatch, retries, and reconciliation continue to function without error.
 
 ---
 
@@ -44,25 +44,25 @@ A team wants to run Symphony-managed work using Claude Code as the coding-agent 
 
 ### User Story 3 - Operate Symphony with Local Work Tracking and Claude Code (Priority: P3)
 
-A team runs Symphony end-to-end using only the local work-tracking source and Claude Code as its coding-agent execution integration — no hosted tracker and no Codex dependency for that deployment. This is a normal supported operating configuration: the local work-tracking source and the Claude Code execution integration are each independently supported capabilities, and running them together is ordinary composition of two supported capabilities, not a special or experimental combination.
+A team runs Symphony end-to-end using only the local work-tracking source and Claude Code as its coding-agent execution integration — no hosted tracker and no Codex dependency for that deployment. This is a normal supported operating configuration: the local work-tracking source and the Claude Code execution integration are each independently supported capabilities, and running them together is ordinary composition of two supported capabilities.
 
 **Why this priority**: This configuration composes two independently required capabilities (User Story 1 and User Story 2) rather than introducing new orchestration behavior of its own, so it is a supported deployment shape but not required to deliver either capability individually.
 
-**Independent Test**: Run a Symphony deployment configured with only the local work source and only Claude Code execution; confirm a work item completes its full lifecycle end to end using only those two components.
+**Independent Test**: Run a Symphony deployment configured with only the local work-tracking source and only Claude Code execution; confirm a work item completes its full lifecycle end to end using only those two components.
 
 **Acceptance Scenarios**:
 
-1. **Given** a deployment configured with only the local work source and Claude Code, **When** a work item becomes dispatch-eligible, **Then** Symphony dispatches, executes, and completes the run using only those two components, with no hosted tracker or Codex involvement.
+1. **Given** a deployment configured with only the local work-tracking source and Claude Code, **When** a work item becomes dispatch-eligible, **Then** Symphony dispatches, executes, and completes the run using only those two components, with no hosted tracker or Codex involvement.
 2. **Given** this configuration, **When** its orchestration decisions are compared to an equivalent Codex + hosted-tracker deployment given equivalent normalized work-item inputs, **Then** scheduler dispatch order, concurrency-limit enforcement, retry/backoff decisions, and reconciliation decisions are the same — only tracker-specific and coding-agent-specific mechanics and incidental timing differ.
 
 ---
 
 ### Edge Cases
 
-- What happens when a required dependency for a configured work-tracking source or coding-agent execution integration is missing or invalid — either detectable at startup, or only encountered at dispatch/runtime (for example, local work-source storage is inaccessible, or a coding-agent executable cannot be found)? Does Symphony validate what it can eagerly at startup using the same operator-visible error-handling pattern it uses today for missing/invalid tracker or Codex configuration, and route anything only detectable later into its normal attempt failure/retry/observability path?
-- What happens if the local work source's storage is deleted, corrupted, or becomes temporarily unreadable between polls? A transient/temporary read failure should be tolerated the way Symphony already tolerates a hosted-tracker outage; corrupt or unreadable durable state must surface as an operator-visible failure rather than being silently recreated, truncated, or reset.
-- How does Symphony behave if a work item's lifecycle state is changed outside of Symphony (for example, a person or another tool directly edits the local work source) while a run for that item is active?
-- What happens to in-flight runs and retry timers when the local work source is unavailable during a poll tick, mirroring how Symphony already tolerates a hosted-tracker outage?
+- What happens when a required dependency for a configured work-tracking source or coding-agent execution integration is missing or invalid — either detectable at startup, or only encountered at dispatch/runtime (for example, a coding-agent executable cannot be found, or the local work-tracking source's storage location is temporarily unreachable)? Does Symphony validate what it can eagerly at startup using the same operator-visible error-handling pattern it uses today for missing/invalid tracker or Codex configuration, and route anything only detectable later into its normal attempt failure/retry/observability path? (Previously established local durable state that is missing, corrupt, or unreadable is a distinct case, addressed by FR-013 and the following edge case, and is not treated as an ordinary attempt failure.)
+- What happens if the local work-tracking source's storage becomes temporarily unreadable between polls, versus if previously established durable state is missing, deleted, or corrupted? A transient, self-resolving read failure should be tolerated the way Symphony already tolerates a hosted-tracker outage. But once local durable state has been established, its disappearance or corruption is not treated as a fresh, empty work-tracking source: Symphony surfaces an operator-visible failure rather than silently recreating, truncating, or resetting it (FR-013).
+- How does Symphony behave if a work item's lifecycle state is changed outside of Symphony (for example, a person or another tool directly edits the local work-tracking source) while a run for that item is active?
+- What happens to in-flight runs and retry timers when the local work-tracking source is unavailable during a poll tick, mirroring how Symphony already tolerates a hosted-tracker outage?
 - If a workflow does not select any coding-agent execution integration, Symphony defaults that deployment to its existing Codex-oriented execution behavior, preserving backward compatibility with today's unconfigured-integration behavior.
 - If a workflow does not configure any work-tracking source, Symphony treats that configuration as invalid — consistent with Symphony's current behavior of requiring a configured tracker — rather than defaulting to a hosted tracker or the local work-tracking source.
 
@@ -82,7 +82,7 @@ A team runs Symphony end-to-end using only the local work-tracking source and Cl
 - **FR-010**: A single Symphony deployment MUST have exactly one active coding-agent execution integration at a time — Codex or Claude Code, not both. Symphony MUST NOT route different work items within one deployment to different coding-agent execution integrations at runtime, and MUST NOT execute Codex and Claude Code concurrently within a single deployment. A team needing both execution integrations in use at once achieves that by running multiple Symphony deployments, each with its own single active coding-agent execution integration, not by adding per-work-item runtime routing to one instance.
 - **FR-011**: Local work-tracking source lifecycle mutations MUST be performed through Symphony's existing tracker-write boundary: workflow/business lifecycle mutations are carried out by agent-invoked, host-executed tracker tooling, rather than by adding tracker-specific lifecycle-write APIs to the orchestrator itself. The specific mechanism implementing that tooling for the local work-tracking source is left unspecified here and belongs to the planning stage.
 - **FR-012**: A single Symphony deployment MUST have exactly one active work-tracking source at a time — either the local work-tracking source or one configured hosted tracker, never more than one simultaneously. This preserves Symphony's existing single-active-tracker-per-deployment model; the local work-tracking source and a hosted tracker are not simultaneously active within one deployment.
-- **FR-013**: If the local work-tracking source's durable state is corrupt or otherwise unreadable, Symphony MUST surface an operator-visible failure rather than silently recreating, truncating, or resetting that state.
+- **FR-013**: Symphony MUST distinguish between initializing a local work-tracking source that has not yet been established and losing access to one that has. A Symphony deployment MAY initialize a new local work-tracking store the first time it is used, by whatever concrete initialization mechanism the planning stage selects. Once a local work-tracking source has been established and Symphony has been operating against it, if its durable state subsequently becomes missing, corrupt, or otherwise unreadable, Symphony MUST surface this as an operator-visible failure of the work-tracking source itself — distinct from an individual work item's attempt failure/retry path — and MUST NOT silently recreate, truncate, reset, or otherwise treat that loss as a new, empty work-tracking source.
 
 ### Inherited Invariants (Existing Symphony Behavior That Remains Unchanged)
 
@@ -95,7 +95,7 @@ A team runs Symphony end-to-end using only the local work-tracking source and Cl
 
 ### Key Entities
 
-- **Local Work Source**: A durable, host/repository-local record of work items that Symphony can poll and update using the same normalized work-item model and lifecycle concepts it already uses for hosted trackers, without depending on any hosted tracker service or hosted control-plane account. Exactly one work-tracking source — this local source, or one hosted tracker — is active within a given Symphony deployment at a time.
+- **Local Work-Tracking Source**: A durable, host/repository-local record of work items that Symphony can poll and update using the same normalized work-item model and lifecycle concepts it already uses for hosted trackers, without depending on any hosted tracker service or hosted control-plane account. Exactly one work-tracking source — this local source, or one hosted tracker — is active within a given Symphony deployment at a time.
 - **Coding-Agent Execution Integration**: A pluggable execution boundary through which Symphony launches, monitors, and completes a coding-agent run for a work item. The existing Codex-oriented integration and the new Claude Code integration are each one such integration; each keeps its own provider-specific behavior localized to itself. Exactly one coding-agent execution integration is active within a given Symphony deployment at a time.
 
 ## Success Criteria *(mandatory)*
@@ -121,7 +121,7 @@ A team runs Symphony end-to-end using only the local work-tracking source and Cl
 
 ## Assumptions
 
-- This capability set is intended as ongoing, maintained behavior for the Symphony fork — not a spike, feasibility trial, or temporary exercise.
+- This capability set is ongoing maintained behavior for the Symphony fork.
 - The local work-tracking source is scoped to durably storing and updating already-defined work items and their lifecycle state; how work items are authored, decomposed, or prioritized before they enter the tracker is out of scope, per the fork's stated scope boundaries.
 - "Local" and "durable" mean the work-tracking source's data survives a Symphony process restart on the same host. Symphony's own in-memory scheduler state (running sessions, retry timers) remains non-durable across restarts exactly as it is upstream; restart recovery continues to work by re-polling the active work-tracking source and reusing preserved workspaces.
 - Claude Code execution is expected to satisfy the same class of runtime guarantees the existing Codex execution integration already satisfies (workspace cwd isolation, structured runtime events, a comparable set of retryable failure classes). This feature does not require Claude Code to expose every Codex-specific capability — only the guarantees this specification's inherited invariants depend on.
