@@ -14,6 +14,7 @@ Replace this placeholder with a concise description of what this project does, w
 
 ## Decisions
 - Bootstrap session (2026-08-25): initialized projectmem and Spec Kit (--integration claude) in this existing repo on branch development. DEVELOPMENT_SPEC intentionally left absent -- no spec content was written this session. Next session should begin the Spec Kit lifecycle (/speckit-constitution, /speckit-specify, etc.) to originate specification content, including for the SQLite tracker and Claude Code worker work ported from the Bindle prototype.
+- Ratified Symphony Development Fork Constitution v1.0.0 at .specify/memory/constitution.md: 7 principles governing how the fork evolves relative to upstream Symphony (inherit upstream first, minimize fork delta, preserve upstream compatibility, specification before implementation, avoid unnecessary abstraction, preserve execution boundaries, verify fork behavior without regressing upstream). Deliberately excludes concrete implementation choices (tracker, storage, agent runner, packaging) -- those belong to the not-yet-written development specification. DEVELOPMENT_SPEC.md was intentionally not created this session. [.specify/memory/constitution.md]
 
 ## Notes
 - Add generic tracker interface with Linear adapter (#102)
