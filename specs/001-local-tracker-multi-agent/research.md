@@ -13,21 +13,36 @@ upstream `SPEC.md`.
 **Decision**: A single durable JSON file per deployment (default
 `.symphony/local_tracker.json`, path resolved the same way `workspace.root` already resolves relative
 to `WORKFLOW.md`), read/written with `Jason` (already a dependency), with all writes going through a
-write-temp-file + atomic-rename sequence.
+write-temp-file + atomic-rename sequence. All access — reads and the one lifecycle write — is mediated
+by a single named `SymphonyElixir.Local.Store` GenServer (see R1a below) rather than each caller doing
+its own unsynchronized `File.read`/`File.write`.
 
-**Rationale**: FR-004 only requires surviving a process restart on the same host — not concurrent
-multi-writer access, not a query language, not multi-GB scale. Constitution Principle V (Avoid
-Unnecessary Abstraction) and II (Minimize Fork Delta) both weigh against introducing a SQL engine: `ecto`
-is already a dependency but is used purely for `embedded_schema` config validation (`Config.Schema`),
-not as a database connection — adding real SQL storage would require `ecto_sql` + a DB adapter (e.g.
-`ecto_sqlite3`) + a `Repo` + migrations, none of which exist in this codebase today. A plain JSON file
-needs zero new dependencies, is human-readable/git-diffable (fitting the "repository-owned,
+**Rationale**: FR-004 only requires surviving a process restart on the same host — not a query language,
+not multi-GB scale. It does NOT exempt the design from Symphony's actual concurrency model: confirmed by
+direct trace of `orchestrator.ex` (`Task.Supervisor.start_child/2`, called once per dispatched issue) and
+`Config.max_concurrent_agents_for_state/1` that one deployment routinely runs multiple work-item attempts
+as genuinely concurrent OTP processes, and tool execution (`Tracker.execute_bound_agent_tool/4`) happens
+synchronously inline within each attempt's own process — so two attempts for two different issues can
+call into the local tracker's lifecycle-write tool at overlapping wall-clock instants. This is Symphony's
+first local-file writer shared across concurrent callers (every existing tracker adapter's "write" is a
+remote API call that serializes at the provider; `WorkflowStore` only ever reads `WORKFLOW.md`), so R1a
+below is required regardless of file format. Given that a single-writer-owner discipline is required
+either way, Constitution Principle V (Avoid Unnecessary Abstraction) and II (Minimize Fork Delta) still
+weigh against introducing a SQL engine: `ecto` is already a dependency but is used purely for
+`embedded_schema` config validation (`Config.Schema`), not as a database connection — adding real SQL
+storage would require `ecto_sql` + a DB adapter (e.g. `ecto_sqlite3`) + a `Repo` + migrations, none of
+which exist in this codebase today, AND would still need the same kind of single-writer discipline
+`ecto_sqlite3` gives you for free at the cost of two new dependencies and migration machinery — a strictly
+worse trade once the actual complexity driver (serialization, not file format) is understood. A plain
+JSON file needs zero new dependencies, is human-readable/git-diffable (fitting the "repository-owned,
 version-controlled" philosophy `SPEC.md` §5.1 already applies to `WORKFLOW.md`), and is trivially
 inspectable by "a person or another tool" per the spec's edge case about out-of-band edits.
 
 **Alternatives considered**:
-- *SQLite via a new `ecto_sqlite3` dependency* — rejected: real new dependency + migration machinery for
-  a workload of "poll and update a handful of local records," contradicting Principle V.
+- *SQLite via a new `ecto_sqlite3` dependency* — reconsidered after identifying the concurrency hazard
+  (R1a) and still rejected: it does not remove the need for single-writer serialization (SQLite itself
+  needs it under concurrent writers), so it only trades "add one GenServer" for "add two new dependencies
+  + a `Repo` + migrations" to solve the same problem, contradicting Principle V.
 - *`:dets` (OTP built-in term storage)* — rejected: binary format is not human-readable/diffable, and
   `:dets` has known table-size and corruption-recovery quirks that add operational surface for no
   benefit at this scale.
@@ -37,23 +52,236 @@ inspectable by "a person or another tool" per the spec's edge case about out-of-
   Left as a documented future refinement if operators report merge-conflict pain, not required by any
   FR/SC here.
 
-## R2. Local tracker: distinguishing "not yet established" from "corrupted" (FR-013)
+## R1a. Local work-tracking source: concurrent-writer safety
 
-**Decision**: File-absence-at-configured-path *is* the "not yet established" signal. `Local.Store`
-initializes a fresh `{"format_version": 1, "issues": {}}` file (via the same atomic write path) only
-when the configured path does not exist. Any other failure to obtain a valid store at that path — JSON
-decode error, unexpected top-level shape, unrecognized `format_version`, permission denied, path exists
-but is not a regular file — is treated as an established-store failure and returned as an
-operator-visible error; `Local.Store` never overwrites a path that exists but failed to parse.
+**Decision**: `SymphonyElixir.Local.Store` is a named singleton `GenServer` (started conditionally, only
+when `tracker.kind: local` is the active structural selection — mirroring how the OPTIONAL HTTP
+observability extension in `SPEC.md` §13.7 is only started when configured), mirroring `WorkflowStore`'s
+`start_link(name: __MODULE__)` pattern. `Local.Adapter.fetch_issues_by_states/1`,
+`fetch_issues_by_ids/1`, and the `local_tracker_set_state` agent tool all go through
+`GenServer.call(Local.Store, ...)` rather than touching the file directly; the GenServer's mailbox
+serializes every read and write against the file, so two concurrently-running work-item attempts can
+never race a read-modify-write cycle against each other.
 
-**Rationale**: This requires no separate "has this ever been initialized" marker or bootstrap
-timestamp — existence of a valid file at the path already carries that information, and it composes
-cleanly with the atomic-write guarantee from R1 (a properly-written file is never left mid-write, so a
-parse failure on an existing file is a genuine integrity problem, not a torn write racing initialization).
+**Rationale**: Confirmed via direct trace (orchestrator.ex `Task.Supervisor.start_child/2` per dispatched
+issue; no existing shared-mutable-file-across-concurrent-writers precedent anywhere in the codebase) that
+this is a real hazard, not a hypothetical: without serialization, two attempts finishing their own
+`local_tracker_set_state` call at overlapping instants could each read the same on-disk snapshot, mutate
+different keys in memory, and the second writer's atomic rename would silently discard the first writer's
+change (a classic lost-update). `GenServer` is the idiomatic, already-dominant concurrency primitive in
+this codebase (`WorkflowStore`, the orchestrator itself) and needs no new dependency — `mix.lock` has no
+mutex/lock library, so a bespoke file-lock would be more code than reusing the pattern already used
+everywhere else here.
 
-**Alternatives considered**: A separate `.initialized` marker file was considered and rejected as an
-extra moving part with no behavior it enables beyond what "does the target path already exist" already
-gives for free.
+**Alternatives considered**:
+- *No serialization, rely on POSIX atomic rename alone* — rejected: atomic rename only guarantees a
+  reader never observes a torn file; it does nothing to prevent two independent read-modify-write cycles
+  from silently overwriting each other's in-memory changes (the lost-update case above only requires
+  R1's atomicity, not this GenServer, to still corrupt no bytes while still losing a whole mutation).
+- *OS-level file locking (`flock`)* — rejected: adds an external-process-coordination concern (locking
+  across OS processes) that this codebase has no existing pattern for, to solve a problem that is
+  entirely within one BEAM VM; a GenServer already provides exclusive access within the VM at zero
+  additional cost.
+- *Per-issue `Agent`/ETS cache with periodic flush* — rejected: introduces a second, eventually-consistent
+  copy of the data (the reason for the eventual sync, and its failure mode on crash) for no benefit over
+  `GenServer.call` directly performing the atomic write inline; adds complexity Principle V weighs
+  against.
+
+## R2. Local tracker: distinguishing "not yet established" from "corrupted"/"lost" (FR-013)
+
+**Decision (twice-revised — this pass replaces the marker-with-self-heal design from the prior
+correction with explicit initialization)**: File-absence-at-the-data-path is still not, by itself, a
+reliable "not yet established" signal — that part of the prior correction was and remains right, for the
+reason already established: a data file that once existed and is later deleted while Symphony is stopped
+is, from a restart's point of view, indistinguishable from a path that was never used. What this pass
+corrects is *how* Symphony learns the difference. The prior design kept a second, independently-durable
+marker file (`<path>.established`) but let `Local.Store` write it **implicitly**, mid-read, whenever
+ordinary polling encountered "data present, marker absent" (a "self-heal"). A second review correctly
+identified this as a fragile inference: it silently promotes an *ambiguous* filesystem condition — which
+could just as easily be a partial backup restore, or an interrupted/half-completed operation — into "this
+is now an established store," using ordinary runtime code that was never meant to be an operator-facing
+initialization API in the first place.
+
+**Corrected model**: Symphony's ordinary runtime — startup validation, polling, dispatch, reconciliation,
+the `Local.Store` GenServer's own read/write path — **never creates or completes either file**, under any
+circumstance, for any reason. Establishment happens only through one small, explicit, separately-invoked
+operation, `symphony local-tracker init` (R2a below). This mirrors how every *other* tracker adapter
+already works: Symphony never auto-creates a GitHub repository, a Jira project, or a Linear team just
+because `tracker.kind` names one and the configured target doesn't exist yet — the hosted resource must
+already be provisioned before Symphony is pointed at it, and if it isn't, `validate_config/1` fails
+startup the same way for every adapter (confirmed: `Local.Adapter.validate_config/1` slots into the exact
+same `WorkflowStore.init/1` → `Config.validate_settings/1` → `Tracker.validate_config/1` chain every
+hosted adapter's `validate_config/1` already uses — `workflow_store.ex:66-75,156-165`, `config.ex:122`,
+`tracker.ex:76-81` — no new plumbing). The local tracker's "hosted resource" is just a file pair instead
+of a remote account, but the same discipline now applies: it must be explicitly provisioned first.
+
+The two files are unchanged in shape and location — the data file at `tracker.provider.path` (default
+`.symphony/local_tracker.json`) and a sibling marker at `<tracker.provider.path>.established` (default
+`.symphony/local_tracker.json.established`, containing `{"established_at": "<RFC 3339 timestamp>"}`) —
+both still written through R1's atomic write-temp+rename path. What changed is that **only R2a's explicit
+init operation may write either file**; nothing else ever does.
+
+**Read/open decision table** (evaluated on every store-open — startup validation and each dispatch-tick
+per `SPEC.md` §6.3 — by ordinary runtime code, which only ever reads):
+
+| Marker | Data file | Outcome |
+|---|---|---|
+| absent | absent | **Not yet initialized.** `{:error, :local_tracker_not_initialized}` — operator-visible startup/dispatch-preflight failure, same failure *class* every other adapter's missing-config error already uses. Remediation: run `symphony local-tracker init`. Ordinary runtime never writes anything in response to this. |
+| absent | present (valid or not) | **Ambiguous — never auto-resolved.** `{:error, {:local_tracker_ambiguous_state, :marker_missing}}`. This is the state a partial backup restore (data file only), an interrupted `init` run, or an operator manually dropping a JSON file into place all produce. Ordinary runtime treats it exactly like "not yet initialized" for scheduling purposes (fails the same way) but with a distinguishing reason so the operator isn't misled into thinking this is a fresh/empty deployment — the data is not touched, inspected further, or promoted to "established" by anything except a deliberate re-run of `init` (R2a). |
+| present | present, valid | Normal operation. |
+| present | absent | **FR-013 established-state loss.** `{:error, {:local_tracker_corrupt, :missing_after_established}}` — operator-visible, source-level failure; `Local.Store` MUST NOT recreate an empty store. |
+| present | present, invalid/corrupt | **FR-013 established-state loss.** `{:error, {:local_tracker_corrupt, reason}}` (unchanged from the original R2's corruption handling). |
+| present, unreadable/corrupt | (any) | Same class as the row above — an unreadable marker is treated as established-state ambiguity/loss, never silently ignored or rewritten. |
+
+**Operational scenarios**:
+
+- *Fresh deployment*: neither file exists. Symphony refuses to start the scheduling loop
+  (`{:error, :local_tracker_not_initialized}`, startup failure) until the operator runs
+  `symphony local-tracker init`.
+- *First initialization*: the operator runs `symphony local-tracker init` (R2a) before first starting
+  Symphony — a deliberate, one-time, out-of-band action, not something Symphony's own poll loop ever does.
+- *Normal restart*: both files present and valid → no writes, normal operation.
+- *Store deleted while Symphony stopped*: marker survives (a separate file, untouched by whatever deleted
+  the data file) → `present`/`absent` row → FR-013 loss, operator-visible, never silently reset.
+- *Store deleted while Symphony running*: the same condition is discovered at the next
+  `fetch_issues_by_states/ids` call (`orchestrator.ex:263`'s `maybe_dispatch/1` tick, confirmed as the
+  actual per-tick detection point — `WorkflowStore`'s `validate_config/1` only re-runs at boot or when
+  `WORKFLOW.md`'s own content changes, not every tick, so the running-time case is caught by the existing
+  read path, not a new periodic re-validation) → FR-008.4/FR-013's existing skip-tick-and-retry behavior,
+  leaving running attempts undisturbed, with the marker present confirming this is loss, not fresh-init.
+- *Store corruption*: unchanged FR-013 handling, either file.
+- *Partial restore from backup (data file only, no marker)*: the `absent`/`present` ambiguous row — never
+  silently accepted as established, never silently discarded either; requires the operator to explicitly
+  re-run `init`, which (R2a) safely completes establishment over already-valid data without touching it,
+  or to restore the marker file from the same backup if they have it.
+- *Copying/restoring the data file without auxiliary metadata*: identical to the case above — this is
+  exactly what the ambiguous row exists to catch, by design, rather than guessing.
+- *Deliberate reset*: `symphony local-tracker init --reset` (R2a) — fully explicit, never inferred from
+  file absence/loss.
+- *Repository checkout / `.gitignore`*: `.symphony/local_tracker.json` and
+  `.symphony/local_tracker.json.established` (the literal default paths, not a blanket `.symphony/`
+  ignore) are added to `elixir/.gitignore`, matching the narrow, path-specific ignore pattern this repo
+  already uses for `.codex/original-user-prompt.txt` (confirmed: `.codex/` itself is not blanket-ignored —
+  only that one file path is; the prior pass's "mirrors `.codex/`'s existing treatment" claim overstated
+  what that precedent actually establishes, and is corrected here). An operator who overrides
+  `tracker.provider.path` to a custom location is responsible for gitignoring that path themselves, same
+  as they would be for any other repo-local runtime file. A fresh `git clone`/`git clean -fdx` therefore
+  always reproduces the "not yet initialized" row — expected and requires the same explicit `init` step as
+  any other fresh deployment, not a special case.
+- *Human/operator comprehensibility six months later*: one mental model — "if Symphony won't start because
+  of the local tracker, run `symphony local-tracker init`; if it refuses because it looks ambiguous or
+  lost, go look at what's actually on disk before doing anything, because something unexpected happened" —
+  replaces the prior design's decision table of when self-healing was safe versus not.
+- *No persistent scheduler state*: unaffected — this remains entirely `Local.Store`/tracker-adapter-owned
+  durability metadata, not scheduler state, unchanged from the original constraint.
+- *No second runtime configuration surface*: `local-tracker init` is a one-time administrative operation
+  invoked outside of, and before, Symphony's own process lifecycle — it reads `WORKFLOW.md` once to
+  resolve `tracker.provider.path` and exits; it does not add a field, flag, or file Symphony's *running*
+  configuration resolution pipeline (`SPEC.md` §6.1) has to know about.
+
+**Alternatives considered**:
+- *The prior pass's marker-with-self-heal design* — superseded by this pass for the reason given above:
+  it is materially safer for ordinary runtime code to never write a file that changes the store's
+  established/not-established status, and to instead require exactly one, clearly-named, explicit action
+  for that transition, than to have polling code infer intent from an ambiguous filesystem condition.
+- *No marker at all — infer everything from data-file presence alone* — rejected, unchanged from the
+  original review: this is the exact blind spot FR-013 exists to close (cannot tell "never established"
+  from "established, now missing").
+- *Explicit init with no marker file (rely on data-file presence alone once "initialized")* — rejected:
+  this has exactly the same restart-loss blind spot as no marker at all the moment the data file is
+  deleted after init runs; the marker's independent durability is still required, only *how it gets
+  written* changed in this pass.
+- *A containing-directory-level signal (e.g. directory ctime, a `.gitkeep`)* — rejected: directory
+  creation-time metadata is platform-inconsistent and not something this codebase's Elixir/OTP file APIs
+  treat as a first-class, portable signal (unlike a file's own content, which `File.read`/`Jason.decode`
+  already handle uniformly across the supported macOS/Linux targets); it also does not distinguish "the
+  directory pre-existed for unrelated reasons" from "Symphony established a tracker here."
+- *A field inside the same data file* — rejected as explained above: it cannot survive the exact failure
+  mode (deletion of that file) it needs to detect.
+- *A store with intrinsic persistent identity/generation metadata embedded in the data file itself, no
+  separate marker* — considered directly per this pass's review prompt, and still rejected for the same
+  structural reason as the single-file alternatives above: any identity that lives *inside* the data file
+  dies exactly when that file is deleted, which is precisely the failure FR-013 requires Symphony to
+  detect. A second, independently-durable file remains necessary; what this pass changes is only that its
+  *creation* is now bound to one explicit operation instead of inferred by ordinary runtime code.
+
+## R2a. Explicit local-tracker initialization: contract and CLI surface
+
+**Decision**: A new operation, `symphony local-tracker init [path-to-WORKFLOW.md]` — a leading subcommand
+on the existing packaged CLI entrypoint, not a `mix` task. Confirmed this distinction is load-bearing, not
+cosmetic: the packaged Burrito single-binary target (`macos_arm64`/`macos_x86_64`/`linux_arm64`/
+`linux_x86_64`, `mix.exs:106-119`) and the `escript` target (`mix.exs:97-103`) both point at the same
+`SymphonyElixir.CLI` entrypoint, and README.md's whole premise for Burrito packaging is that a production
+operator has no `mix`/Elixir toolchain available — only the single binary. A `mix symphony.local_tracker.init`
+task (mirroring the existing small-task precedent in `lib/mix/tasks/` — `pr_body.check.ex`,
+`specs.check.ex`, `workspace.before_remove.ex`) would be invisible to that operator entirely. `init` must
+therefore be reachable from `bin/symphony`/the packaged binary itself.
+
+**Contract** (implementation retains full latitude over exact flag names/output formatting/error text —
+this is the planning-level minimum, not a UI spec):
+
+- `CLI.evaluate/2` (`cli.ex:39-58`) gains a new leading-subcommand branch recognized before the existing
+  "run against a WORKFLOW.md path" behavior: a first positional argument of `local-tracker` with a second
+  positional argument `init`, followed by an optional WORKFLOW.md path (default `./WORKFLOW.md`, exactly
+  matching the existing run behavior's default resolution). Every existing invocation shape (no leading
+  `local-tracker` argument) is completely unaffected — this is purely additive to the argument grammar.
+- Effect: loads and parses the given `WORKFLOW.md` (reusing the same `Workflow.load/1` → `Schema.parse/1`
+  path `WorkflowStore` already uses — no second parser), resolves `tracker.provider.path` (only meaningful
+  when that workflow's `tracker.kind: local`; any other `tracker.kind` is a usage error, since there is
+  nothing local to initialize), then performs an atomic two-file creation: write the data file
+  (`{"format_version": 1, "issues": {}}`, via R1's atomic write-temp+rename) **first**, then the marker
+  file (`{"established_at": "<RFC 3339 timestamp>"}`) **second** — the ordering matters for crash-safety:
+  a crash between the two writes leaves "data present, marker absent," which is R2's ambiguous row, not a
+  corrupt/torn file, and is exactly what re-running `init` is designed to safely resolve (see idempotency
+  below). Prints a confirmation and exits `0`. Does **not** start the orchestrator, scheduler, or any
+  supervision tree — `init` is a standalone, short-lived operation, not an alternate way to run Symphony.
+- **Idempotency / safe re-run**: if both files already exist and are valid, `init` refuses by default
+  (does not touch anything) with a message explaining the store is already established — this prevents an
+  operator from accidentally clobbering a live store by re-running `init` out of habit. If **only** the
+  data file exists (valid or not) and the marker is missing — R2's ambiguous row, whether from a crashed
+  prior `init`, a partial restore, or a hand-placed file — re-running `init` is exactly the sanctioned way
+  to resolve it: if the existing data file parses as a valid store, `init` writes the marker to complete
+  establishment **without modifying the data file's contents**; if the data file is present but does not
+  parse, `init` refuses (this is not a case `init` can safely resolve — the operator must restore valid
+  data or explicitly reset, below) with a clear error rather than silently discarding it.
+- **Deliberate reset**: a `--reset` flag (exact name is an implementation detail) is required to
+  overwrite/replace an already-established store — it deletes both files (if present) and performs a
+  fresh two-file creation as above. Without `--reset`, `init` never overwrites existing valid data.
+- **Concurrency with a running Symphony process**: `init` is a separate, short-lived OS process invocation
+  — it is not synchronized with a live `Local.Store` GenServer in a separately-running Symphony process
+  (out of scope, matching R1's existing single-deployment-durability scope: this codebase does not
+  synchronize cross-process writers to the local store, per R1a's own stated boundary). An operator who
+  runs `init --reset` against a store an already-running Symphony deployment is actively using produces
+  the same class of outcome any other out-of-band edit to the data file already produces (spec Edge Case:
+  "What happens if a work item's lifecycle state is changed outside of Symphony... while a run for that
+  item is active?") — this is an existing, already-accepted scope boundary, not a new gap introduced here.
+
+**Rationale**: This is the smallest mechanism that gives FR-013's required distinction an unambiguous,
+comprehensible operator model: "the store is provisioned by one explicit action, exactly like every other
+tracker's underlying resource already has to be," rather than a set of implicit rules ordinary polling
+code must get right on every read. It adds one CLI subcommand (a real but small, first-of-its-kind
+addition to `CLI.evaluate/2`'s argument grammar) and reuses every other piece of existing machinery
+(`Workflow.load/1`, `Schema.parse/1`, R1's atomic write path) — no new dependency, no new process type, no
+persistent scheduler state, no second runtime configuration surface.
+
+**Alternatives considered**:
+- *A `mix` task only, no packaged-CLI subcommand* — rejected: confirmed unreachable by a production
+  operator running the Burrito-packaged binary, which is the deployment target README.md documents as the
+  normal one.
+- *Tie initialization to "whatever operation first creates/installs local work" (e.g. auto-init on the
+  first hand-edit or first seeding-tool write)* — rejected: this is out of scope per the frozen spec's own
+  Non-Goals ("Deciding how work enters the local work-tracking source... is out of scope"), and it would
+  reintroduce exactly the kind of implicit, ordinary-code-path establishment this pass is removing — there
+  is no single, well-defined "first write" event to hook if work can enter the store by hand-editing JSON,
+  a future seeding tool, or any other means.
+- *No explicit init at all; refuse forever if the store is missing, no distinguishing detail between
+  "never" and "lost"* — rejected: technically avoids ever silently auto-resetting (satisfies FR-013's
+  prohibition), but fails FR-013's affirmative requirement to *distinguish* the two states in a way an
+  operator can act on differently — a fresh deployment's remediation ("run init") and an established-loss
+  incident's remediation ("investigate what happened to your data, then decide whether to restore or
+  reset") are genuinely different operator actions, and collapsing them into one undifferentiated error
+  would be a worse operator experience than what this design provides at negligible extra cost (one
+  additional file, one additional CLI branch).
 
 ## R3. Local tracker: agent-invoked lifecycle-write mechanism (FR-003, FR-011)
 
@@ -83,14 +311,24 @@ public API — `start_session(workspace, opts) :: {:ok, session} | {:error, reas
 (no functional change; it already satisfies this shape). `AgentRunner` resolves which module to call via
 `Config` (see R9) instead of hardcoding `alias SymphonyElixir.Codex.AppServer`.
 
-**Rationale**: `AgentRunner.run_codex_turns/5` is the single call site that drives session lifecycle
-(`start_session` once, `run_turn` per turn in a loop bounded by `agent.max_turns` and tracker-driven
-continuation, `stop_session` in an `after` block). That loop, the retry/backoff decision after a failed
-turn, and the continuation decision (`continue_with_issue?/2`, which reads back from `Tracker`) are all
-orchestration concerns that must stay unchanged per IV-002 — they belong above this seam, not inside it.
-Naming and formalizing exactly the shape already implicitly relied upon is the smallest possible
-change: no new session-lifecycle concepts, no generic multi-provider registry (explicitly out of scope
-per the spec's Non-Goals), just an interface extracted from working code.
+**Verified against actual current code** (this plan's prior draft asserted this shape without checking
+it against the real function signatures — now confirmed by direct read of `codex/app_server.ex` and
+`agent_runner.ex`): `Codex.AppServer.start_session/2` really does return `{:ok, session}` where `session`
+is the map `%{port:, metadata:, approval_policy:, ..., thread_id:, workspace:, ...}`
+(`app_server.ex:14-25,38-69`). `run_turn/4` really does return `{:ok, %{result:, session_id:, thread_id:,
+turn_id:}}` (`app_server.ex:71-143`) — note this returned map has **no `session` key at all**. `stop_session/1`
+really does match `%{port: port}` (`app_server.ex:145-148`). The three-callback shape is accurate; see
+R7 below for what the *return value* of `run_turn/4` needs to carry, which the prior draft left
+underspecified (Issue 3 from review).
+
+**Rationale**: `AgentRunner.run_codex_turns/5`/`do_run_codex_turns/8` is the single call site that drives
+session lifecycle (`start_session` once, `run_turn` per turn in a loop bounded by `agent.max_turns` and
+tracker-driven continuation, `stop_session` in an `after` block). That loop, the retry/backoff decision
+after a failed turn, and the continuation decision (`continue_with_issue?/2`, which reads back from
+`Tracker`) are all orchestration concerns that must stay unchanged per IV-002 — they belong above this
+seam, not inside it. Naming and formalizing exactly the shape already implicitly relied upon is the
+smallest possible change: no new session-lifecycle concepts, no generic multi-provider registry
+(explicitly out of scope per the spec's Non-Goals), just an interface extracted from working code.
 
 **Alternatives considered**: A richer behaviour exposing lower-level primitives (raw message send/
 receive) was rejected — it would leak Codex's JSON-RPC transport shape into the contract, violating
@@ -115,69 +353,330 @@ already handles, so the existing receive-loop pattern generalizes without a new 
 Exit codes are `0` (success), `1` (failure), `130`/`143` (signal termination) — mapped the same way
 `Codex.AppServer` already maps `port_exit` today.
 
-**Confidence note**: exact event-type names inside the stream-json payloads (the Claude Code analogue of
-Codex's `turn/completed`/`turn/failed`) were not independently re-verified line-by-line against a live
-CLI run in this planning pass and MUST be confirmed against the installed Claude Code CLI version's own
-`--help`/schema output during implementation, the same way `SPEC.md` §10 already requires implementers to
-treat the *targeted* Codex app-server version as the protocol source of truth rather than the spec text.
+**Confirmed this pass** (via `claude --help` on the installed v2.1.245 and `code.claude.com/docs/en/headless`,
+superseding the prior "not independently re-verified" note for these specific items): `--verbose` really
+is required for `--output-format stream-json` to actually stream — the docs state the pattern as "Use
+`--output-format stream-json` with `--verbose` and `--include-partial-messages` to receive tokens as
+they're generated," not merely "override verbose mode" as the bare `--help` line for `--verbose` alone
+might suggest. Also newly identified and worth folding into the launch contract: `--bare` ("Minimal
+mode: skip hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and
+CLAUDE.md auto-discovery... Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper`... OAuth and
+keychain are never read") is documented as "the recommended mode for scripted and SDK calls" and is
+planned to become `-p`'s default in a future release; it still honors `--mcp-config`, `--allowedTools`,
+`--append-system-prompt`, `--settings`, and `--add-dir` per its own compatibility table. Since Symphony's
+launches are unattended automation exactly matching `--bare`'s stated use case, and since a project's own
+`.claude/settings.json`/`.mcp.json`/`CLAUDE.md` are otherwise loaded even in an untrusted directory under
+plain `-p` (per the headless docs' own trust-dialog note), `claude_code.command`'s default invocation
+SHOULD include `--bare` — this also forces the `ANTHROPIC_API_KEY`-only auth path R8 already requires,
+rather than that being a separately-enforced isolation rule.
 
-## R6. Claude Code: tool exposure (tracker agent tools)
+**Confidence note (narrowed)**: exact event-type names inside the stream-json payloads (the Claude Code
+analogue of Codex's `turn/completed`/`turn/failed`) were not independently re-verified line-by-line
+against a live CLI run in this planning pass (deliberately — no real prompt/turn was executed during this
+research pass) and MUST be confirmed against the installed Claude Code CLI version's own `--help`/schema
+output during implementation, the same way `SPEC.md` §10 already requires implementers to treat the
+*targeted* Codex app-server version as the protocol source of truth rather than the spec text. This is
+now the only remaining low-confidence item from the original R5.
 
-**Decision**: Symphony hosts a short-lived local stdio MCP server (a new `ClaudeCode.MCPServer`) for the
-duration of one run, and points the `claude` CLI at it per-invocation via `--mcp-config <path-to-a
-per-run-generated JSON file>`. The MCP server process, on a tool call, dispatches to
-`Tracker.execute_bound_agent_tool/4` exactly like `Codex.DynamicTool.execute/4` does today — same
-adapter binding, same tracker tools, different wire protocol.
+## R6. Claude Code: tool exposure (tracker agent tools) — corrected process topology
 
-**Rationale/evidence**: Claude Code's tool-exposure mechanism is MCP (Model Context Protocol), not
-Codex's proprietary `dynamicTools`/`item/tool/call` JSON-RPC pair. Per `--mcp-config`'s documented
-behavior, the *client* (`claude`) spawns the configured MCP server as its own child process from the
-`command`/`args` in that config — so Symphony's role is to generate that config (pointing at a small
-executable entry point that runs the MCP server loop) before launching `claude`, not to pre-start a
-server the CLI connects out to. This keeps FR-007's localization requirement intact: the MCP stdio
-JSON-RPC framing lives entirely inside `ClaudeCode.MCPServer`/`ClaudeCode.DynamicTool`, and `Tracker`
-itself stays protocol-agnostic (it already is — `execute_bound_agent_tool/4` takes tool name + arguments
-+ opts, with no assumption about which wire protocol produced them).
+**Prior plan's gap**: The original decision below is corrected. It asserted, without verifying, that
+"`claude` spawns the configured MCP server as its own child process" and that this spawned process
+"dispatches to `Tracker.execute_bound_agent_tool/4` exactly like `Codex.DynamicTool.execute/4` does
+today." Those two claims do not compose: `Codex.DynamicTool.execute/4` is an ordinary Elixir function
+call, invoked synchronously from *inside the same BEAM process* by `Codex.AppServer`'s own receive loop
+when it sees an `item/tool/call` JSON-RPC message arrive on the *same* stdio `Port` Symphony already
+holds open to the `codex app-server` subprocess (confirmed: `app_server.ex` — `run_turn/4`'s
+`tool_executor` closure calls `DynamicTool.execute/4` directly, invoked from `await_turn_completion/4`'s
+handling of messages read off that one Port). A stdio MCP server spawned as `claude`'s own child OS
+process is a *different* process tree entirely — it is not a child of the Elixir BEAM, has no Port
+Symphony holds, and cannot call an Elixir function that only exists inside the running Symphony VM
+without some explicit IPC channel, which the prior plan never specified. This is exactly the "implicit
+cross-process function call" gap identified in review.
 
-**Alternatives considered**: Skipping tool exposure entirely for Claude Code (agent can only edit files,
-never call `local_tracker_set_state` or `github_api`) was rejected — it would silently break FR-003's
-workflow-directed lifecycle mutation and any hosted-tracker provider-native tool for Claude-Code-executed
-work, which nothing in the spec permits as a Claude-Code-specific carve-out.
+**Decision (corrected)**: Symphony hosts the MCP server itself, inside the same BEAM process as the
+orchestrator, as an HTTP endpoint via `Bandit` (already a dependency — the same library `SPEC.md` §13.7's
+OPTIONAL observability HTTP extension already uses, which documents the exact pattern reused here:
+bind loopback (`127.0.0.1`) by default, support an ephemeral port, and treat listener changes as
+restart-required). A new `ClaudeCode.MCPServer` starts its own small Bandit listener — independent of
+the separately-OPTIONAL observability dashboard, since MCP tool exposure must work whether or not an
+operator has enabled `server.port` — bound to `127.0.0.1:0` for the lifetime of one run, and Symphony
+generates a per-run `--mcp-config` JSON pointing `claude` at it as a **remote HTTP** server entry:
+`{"mcpServers": {"symphony_tracker": {"type": "http", "url": "http://127.0.0.1:<port>/mcp/<run-token>"}}}`.
+`claude` connects **out** to this URL over an ordinary loopback HTTP request; Symphony never spawns a
+second OS process for tool exposure at all. On each tool call, the HTTP handler (running as ordinary
+Elixir/Plug code inside the same BEAM process the orchestrator runs in) calls
+`Tracker.execute_bound_agent_tool/4` directly — a genuine in-process function call, exactly the same
+class of "already inside the BEAM" call `Codex.DynamicTool.execute/4` makes today, just reached over a
+loopback HTTP request instead of a stdio Port message. The per-run token in the URL path scopes each
+connection to its own run's tracker binding (defense in depth on top of loopback-only binding, closing
+FR-009 isolation for this channel).
 
-## R7. Claude Code: session/turn continuation model
+**Rationale/evidence**: Confirmed via `claude mcp add --help`, `claude mcp add --transport http|sse`
+examples, and Claude Code's current MCP reference documentation
+(`code.claude.com/docs/en/mcp`) that `--mcp-config`/`.mcp.json` entries support a `"type": "http"`
+(also accepting the MCP-spec alias `"streamable-http"`) entry with a `"url"` field, alongside the local
+stdio `"command"`/`"args"`/`"env"` entry shape — i.e. remote HTTP MCP servers that the CLI connects *out*
+to are a first-class, documented transport, not something inferred or assumed. This makes Symphony the
+MCP **server** and `claude` the MCP **client**, which is the standard client/server direction for HTTP
+transport and requires no new dependency (Bandit is present), no distributed-Erlang setup (none exists
+in this codebase today and none is added), and no second OS process whose stdio Symphony would otherwise
+need some other channel to reach. This keeps FR-007's localization requirement intact: the MCP wire
+protocol (HTTP handler, JSON-RPC-over-HTTP framing) lives entirely inside `ClaudeCode.MCPServer`, and
+`Tracker` itself stays protocol-agnostic exactly as before (`execute_bound_agent_tool/4` takes tool name
++ arguments + opts, with no assumption about which wire protocol produced them) — the only change from
+the original plan is *how* a tool call physically reaches that function, not what receives it.
 
-**Decision**: `ClaudeCode.AppServer.start_session/2` performs only workspace/MCP-config preparation and
-returns an opaque session map with `session_id: nil` (not yet known — Claude Code assigns it on first
-run) plus the prepared MCP config path; it does **not** spawn a long-lived process. Each
-`ClaudeCode.AppServer.run_turn/4` call spawns a fresh `claude -p` process for that turn: the first turn
-omits `--resume`, and every subsequent turn passes `--resume <session_id>` using the session ID captured
-from the previous turn's stream-json output. `stop_session/1` removes the per-run MCP config temp file
-(there is no live process to terminate in the normal case).
+**Alternatives considered**:
+- *Stdio MCP child process, as originally planned* — rejected once the process-boundary gap was
+  identified: it requires either (a) Symphony reading that child's own stdout, which Port only lets
+  the process that spawned a subprocess do, and Symphony does not spawn this one — `claude` does — or (b)
+  some new IPC (distributed Erlang, a Unix domain socket, a second localhost TCP listener the child
+  connects to) layered on top, which is strictly more moving parts than a Bandit HTTP endpoint Symphony
+  already knows how to run.
+- *Symphony's own Port for `claude` doubling as the tool-call channel (i.e. Claude Code speaks its tool
+  calls over the same stdio stream as its turn output, the way Codex does)* — rejected: this is not how
+  Claude Code's headless mode works. Claude Code's tool-exposure mechanism is MCP, a protocol
+  independent of `--output-format stream-json`'s turn-event stream; there is no documented way to
+  multiplex MCP tool calls onto the `stream-json` stdout stream instead of a real MCP transport.
+- *Skipping tool exposure entirely for Claude Code* (agent can only edit files, never call
+  `local_tracker_set_state` or a hosted tracker's provider-native tool) — rejected, unchanged from the
+  original decision: it would silently break FR-003's workflow-directed lifecycle mutation, which nothing
+  in the spec permits as a Claude-Code-specific carve-out.
+- *SSE transport instead of HTTP* — rejected: `claude mcp add --help`'s own guidance is that SSE is
+  deprecated in favor of `http` where available, and Symphony's server is one Symphony controls
+  end-to-end, so there is no reason to target the deprecated transport.
 
-**Rationale/evidence**: Unlike the Codex app-server (one long-lived subprocess, one open `thread_id`
-reused via JSON-RPC calls into that same live process for every turn), Claude Code's headless mode is
-one full process invocation per turn; continuity across turns is transcript-based (stored under
-`~/.claude/projects/...`) and resumed with `--resume <session-id>` or `--continue`, per Claude Code's own
-session-management documentation. This is exactly the kind of provider-specific lifecycle mechanic
-Principle VI requires to stay localized: `CodingAgent`'s 3-callback contract (R4) deliberately does not
-assume "a process is now running" after `start_session`, so this asymmetry is fully absorbed inside
-`ClaudeCode.AppServer` and invisible to `AgentRunner`'s turn loop, which only ever sees
-`{:ok, session}` / `{:ok, turn_result}` / `:ok`.
+## R6a. Claude Code MCP: process topology, session/issue binding, authentication, and remote-worker scope
 
-**Confidence note**: whether `--resume` vs `--continue` is the more robust choice for Symphony's
-explicit-session-id use case should be re-confirmed against the installed CLI version at implementation
-time; `--resume <id>` is used here because it targets an exact prior session rather than "most recent,"
-which matters once multiple workspaces/issues run concurrently on one host.
+This section fully specifies the process topology, request-binding, and authentication model R6 left
+implicit, and resolves whether it works under `worker_host` (SSH remote execution). Investigated directly
+against `agent_runner.ex`, `codex/app_server.ex`, `ssh.ex`, `workspace.ex`, and `tracker.ex` rather than
+assumed.
+
+**Process topology — one `ClaudeCode.MCPServer` per coding-agent run, not per Symphony process, per
+worker host, or per turn.** `AgentRunner.run/3` (`agent_runner.ex:21-36`) already scopes one call to
+exactly one issue's one run attempt, running inside its own `Task.Supervisor`-spawned process
+(`orchestrator.ex`); `ClaudeCode.AppServer.start_session/2` starts exactly one `ClaudeCode.MCPServer`
+Bandit listener as part of that same run's process tree — a direct child of the run's own supervision
+subtree, not a globally-registered singleton and not one-per-turn. It is:
+
+- **Started**: in `start_session/2`, once, before the first turn — mirroring exactly where Codex's
+  `dynamic_tool_binding = DynamicTool.bind()` is captured once (`app_server.ex:41`) and where Codex's
+  `Port` is opened once for the whole run.
+- **Owned/lifecycle**: the run's own process (the same process `AgentRunner.run_codex_turns/5`'s `try`/
+  `after` already wraps around `start_session`/`stop_session`, `agent_runner.ex:92-98`) — no separate
+  supervisor, no registry, no `DynamicSupervisor` needed beyond what a Bandit `child_spec` started under
+  the run's own linked process tree already provides.
+- **Reused across turns**: Claude Code spawns a fresh OS process per turn (R7), but the MCP listener is
+  *not* per-turn — the tracker binding and current issue don't change turn-to-turn within one run, so one
+  listener instance serves every turn's tool calls for that run, started once and torn down once.
+- **Stopped**: in `stop_session/1`, always, from the caller's `after` block (unchanged — R4/contract). If
+  the run's process itself dies abnormally (BEAM crash, `Task.Supervisor` child killed), the listener dies
+  with it automatically via ordinary OTP supervision — it is a linked child of that process, not a
+  separately-supervised long-lived resource, so no extra cleanup code is needed for the abnormal-exit case
+  beyond what already exists for every other per-run resource.
+- **What happens on abnormal agent termination mid-turn**: the in-flight `claude -p` OS process for that
+  turn exiting abnormally is handled entirely by `run_turn/4`'s existing failure path (R4/contract, `{:error,
+  reason}`, routed into FR-008.2's attempt-failure/retry path) — this has no special interaction with the
+  MCP listener, which simply keeps running (ready for the *next* turn, if the run continues) until
+  `stop_session/1` tears it down in the outer `after` block regardless of how the last turn ended.
+
+**Session/issue binding — no global lookup table, no "current issue" state.** `Tracker.bind_agent_tools/0`
+(`tracker.ex:48-59`) returns a plain immutable map (`%{adapter:, tracker_settings:, tool_specs:,
+secret_environment_names:}`) with no process reference or global identity — confirmed this is exactly the
+same shape Codex already captures once per session. `ClaudeCode.AppServer.start_session/2` captures this
+binding, plus the current `Tracker.Issue.t()`, **once**, and passes both directly into the
+`ClaudeCode.MCPServer` process it starts for this run — the listener's own state (a Plug/Bandit process
+holding `{dynamic_tool_binding, issue}` in its own initial state, not fetched per-request from anywhere
+shared) *is* the binding. An incoming MCP tool-call HTTP request therefore cannot be misrouted to another
+run's issue: there is no routing step at all, no map keyed by session/issue ID to look up — the process
+handling the request only ever has one run's binding and one run's issue in scope, structurally, because
+it was started with exactly that context and no other. This directly satisfies "do not rely on global
+current-issue state": there is no global state of any kind in this design, only per-run process-local
+state, exactly mirroring how Codex's `dynamic_tool_binding` already lives inside that one session's own
+data, never in a shared table.
+
+**Where the bound context lives, end to end**: `Tracker.bind_agent_tools/0` is called once, inside
+`ClaudeCode.AppServer.start_session/2` (same call site pattern as `Codex.AppServer.start_session/2`,
+`app_server.ex:41`) → the returned map plus the current issue are passed as the `ClaudeCode.MCPServer`
+child's start arguments → held in that process's own state for the run's lifetime → read (never mutated)
+on every tool-call HTTP request the listener handles → passed to
+`Tracker.execute_bound_agent_tool/4` (`tracker.ex:61-74`) exactly as `Codex.DynamicTool.execute/4` already
+does. No ETS table, no Registry, no additional process holds a copy — one process, one binding, for the
+run's whole lifetime.
+
+**Authentication/authorization — per-run listener plus a per-run unguessable token, both load-bearing.**
+Two independent, minimal mechanisms, chosen because the process-per-run topology above is itself already
+most of the isolation guarantee:
+
+- The **per-run listener** means even with zero additional auth, a request reaching a given run's port can
+  only ever invoke *that* run's tracker binding — there is no cross-run routing surface to exploit because
+  each run's listener has no knowledge of any other run.
+- A **per-run, cryptographically-random, unguessable token**, embedded in the URL path Symphony generates
+  for that run's `--mcp-config` entry (`http://127.0.0.1:<port>/mcp/<run-token>`, R6), checked on every
+  request before it reaches the tool-dispatch handler — this is the second, independent layer: even though
+  each port already maps to exactly one run, the port number itself is a small, potentially-enumerable
+  space on a shared host (visible via `netstat`/`ps` to any other local process), so the token is what
+  actually prevents an unrelated local process (not just an unrelated *Symphony run*) from invoking this
+  run's tracker tool merely by guessing or observing which ports are open. This is the smallest capability
+  model that gives genuine session isolation without new auth infrastructure — no shared secret store, no
+  TLS/certificate machinery (loopback-only, so unnecessary), no session-registry service.
+- `--strict-mcp-config` (R8, confirmed CLI flag) ensures `claude` only ever attempts to reach the one MCP
+  server entry Symphony explicitly generated for this run, ignoring any ambient `.mcp.json`/user-level MCP
+  config that might otherwise expose unrelated tools.
+- **Two concurrent Claude-backed work items cannot cross-call each other's tracker context** as a direct
+  consequence of the above: each has its own ephemeral port (OS-assigned, guaranteed distinct) and its own
+  random token; there is no shared listener, shared token store, or shared binding table between them to
+  confuse.
+
+**Remote worker (`worker_host`/SSH) compatibility — explicitly out of scope for this feature, not silently
+dropped.** Confirmed by direct trace (`agent_runner.ex:24-47` → `codex/app_server.ex:192` vs. `:216` →
+`ssh.ex:11-49`, plus `workspace.ex`'s separate remote-branch workspace creation) that Symphony's existing
+remote-worker execution model:
+
+- Has **no shared filesystem** between the orchestrator host and a worker host — the remote workspace path
+  is independently resolved on the remote host via its own `pwd -P` shell round-trip
+  (`workspace.ex:38-51,54-81`), and is not guaranteed (or expected) to equal the orchestrator-host path for
+  the same issue.
+- Has **no existing remote-file-delivery mechanism** — Codex's remote launch (`app_server.ex:230-238`)
+  passes everything the remote `codex app-server` process needs via the SSH-wrapped shell command line and
+  the JSON-RPC/stdio channel itself; nothing is `scp`'d, `rsync`'d, or otherwise written to the remote
+  filesystem by Symphony today, confirmed by an empty search across `lib/` and `docs/`.
+- Has **no existing SSH port-forwarding usage or documentation** — `SSH.ssh_args/2` (`ssh.ex:41-49`) is
+  hardcoded to `[-T] [-p port] destination command`, no `-L`/`-R`/`-D` anywhere; whether a hypothetical
+  `-R <remote_port>:127.0.0.1:<local_port>` reverse-tunnel would even work depends entirely on the
+  *remote* host's own `sshd_config` (`AllowTcpForwarding`/`GatewayPorts`), which Symphony has no way to
+  inspect, control, or fail loudly against in advance — a request to a "loopback" port that silently never
+  gets forwarded (forwarding disabled server-side) fails as an unhelpful connection-refused deep inside a
+  live coding-agent turn, not as a clear startup validation error.
+
+Given that: (a) `worker_host`/SSH remote execution is not mentioned anywhere in the frozen `spec.md` or
+upstream `SPEC.md` as a requirement of this feature — confirmed by direct grep of both, zero matches for
+"worker_host"/"remote execution"/"ssh" as a normative requirement; (b) the frozen spec's own Assumptions
+section explicitly states Claude Code "does not require Claude Code to expose every Codex-specific
+capability — only the guarantees this specification's inherited invariants depend on," and none of
+IV-001–IV-006 depend on remote-worker support specifically; and (c) building genuine remote-worker MCP
+support today would require inventing either a new remote-file-delivery mechanism or an SSH-forwarding
+bridge whose reliability Symphony cannot verify or control — a materially larger, less certain piece of
+new machinery than anything else in this feature, for a capability nothing requires —
+
+**Decision**: Claude Code coding-agent execution (`agent_execution.kind: claude_code`) supports **local
+execution only** in this feature. `worker_host`/`worker.ssh_hosts` remain fully, unchangedly supported for
+Codex (`agent_execution.kind: codex`, the default) — nothing about Codex's existing remote-worker behavior
+is touched. This combination is invalid configuration, enforced at two points:
+
+- **Config validation** (new cross-field check, alongside the existing per-adapter `validate_config/1`
+  calls in the same `Config.validate_settings/1` pipeline, `config.ex:122`): `agent_execution.kind:
+  claude_code` together with a non-empty `worker.ssh_hosts` fails startup validation with a clear message
+  ("Claude Code execution does not support remote worker hosts in this release; unset `worker.ssh_hosts`
+  or use `agent_execution.kind: codex`") — same operator-visible startup-failure class as every other
+  config validation error (§6.3).
+- **Defense in depth**: `ClaudeCode.AppServer.start_session/2` itself returns
+  `{:error, :remote_worker_not_supported}` (routed into FR-008.2's attempt-failure/retry path, not a
+  crash) if ever invoked with a non-nil `worker_host` despite the startup check — the same
+  belt-and-suspenders pattern `CodingAgent.start_session/2`'s contract already requires for any
+  dependency failure that prevents attempting a turn.
+
+Because Claude Code is local-only, the `--mcp-config` file-delivery question resolves trivially: Symphony
+writes the per-run MCP config JSON to a local temp path and passes it to a **locally**-spawned `claude`
+process (a plain `Port.open/2`, exactly mirroring Codex's local, non-SSH branch — `app_server.ex`'s
+`worker_host == nil` path) — no remote file needs to exist anywhere, and the loopback URL genuinely is the
+same host's loopback for both Symphony and `claude`.
+
+**Alternatives considered**:
+- *SSH reverse port-forwarding (`-R`) bridging a remote `claude` to the orchestrator-hosted listener* —
+  architecturally clean to add (no existing flag conflict) but rejected for this feature: its success
+  depends on remote `sshd` configuration Symphony cannot verify, so a misconfigured remote host would fail
+  silently/confusingly deep inside a turn rather than at startup validation — the opposite of this
+  project's operator-visible-failure discipline, for a capability nothing in the spec requires.
+- *A minimal MCP endpoint running on the worker host itself* (spawned alongside `claude` via the same SSH
+  session) — rejected: this is a second, remote-host-resident BEAM-independent process that would still
+  need some way to reach back into the orchestrator's live `Tracker` binding (raw tracker credentials
+  cannot be shipped to it per FR-009), reintroducing a real IPC-design problem, not avoiding one.
+- *Silently running Claude Code locally even when `worker.ssh_hosts` is configured, ignoring the setting*
+  — rejected outright: this is precisely the "silently degrade existing worker-host semantics" outcome
+  this pass was directed to avoid; an explicit, loud startup validation failure is the correct behavior
+  instead.
+- *Building full remote support now, since it is a plausible eventual requirement* — rejected per
+  Constitution Principle V (avoid unnecessary abstraction absent a demonstrated requirement) and the
+  decision criteria's preference for the smallest total architecture; left as a documented, explicit future
+  extension rather than spent effort against a capability nothing currently requires.
+
+## R7. Claude Code: session/turn continuation model — corrected to close the CodingAgent contract gap
+
+**Prior plan's gap** (Issue 3 from review): the prior decision below had Claude Code *learn* its
+`session_id` reactively from turn 1's own output, then required `run_turn/4` to "return an updated
+opaque session term" so `AgentRunner` could thread it into turn 2. But `AgentRunner.do_run_codex_turns/8`
+does not do this today, and never has: its recursive call at `agent_runner.ex:117-126` always passes the
+**original** `app_session` from `start_session/2` forward into the next turn, unconditionally — the
+`{:ok, turn_session}` value `AppServer.run_turn/4` returns is only ever used for its `session_id` in a
+log line (`agent_runner.ex:111`) and is otherwise discarded. And `Codex.AppServer.run_turn/4`'s actual
+return shape (`%{result:, session_id:, thread_id:, turn_id:}`, confirmed in R4) has no `session` key to
+carry such a value even if `AgentRunner` did thread it. The contract's "MAY return an updated session...
+MUST thread it forward" language was therefore asking for a mechanism that exists in neither Codex's
+current return shape nor `AgentRunner`'s current loop — an implicit gap, not an implemented seam.
+
+**Decision (corrected)**: Symphony — not Claude Code — chooses and owns the session identity, using
+`--session-id <uuid>` (confirmed via `claude --help`: "Use a specific session ID for the conversation
+(must be a valid UUID)"). `ClaudeCode.AppServer.start_session/2` generates one UUID (e.g. via
+`Ecto.UUID.generate/0` — `ecto` is already a dependency), performs workspace/MCP-config preparation
+(including starting the per-run `ClaudeCode.MCPServer` Bandit listener, R6), and returns an opaque
+session map holding that fixed `session_id` plus the prepared MCP config path; it does **not** spawn a
+long-lived process, since Claude Code's headless mode has none. Turn 1's `run_turn/4` spawns
+`claude -p ... --session-id <the-generated-uuid>` (no `--resume`, since nothing exists yet to resume);
+every subsequent turn spawns `claude -p ... --resume <the-same-uuid>`. The session identity **never
+changes turn to turn** — this exactly mirrors Codex's own model, where `thread_id` is captured once in
+`start_session/2` and reused unchanged for every continuation turn (confirmed upstream precedent:
+`SPEC.md` §10.2, "Reuse the same `thread_id` for all continuation turns inside one worker run"; confirmed
+in current code: `app_server.ex`'s `session.thread_id` is set once in `start_session/2` and never
+reassigned by `run_turn/4`).
+
+Because the session identity is now fixed at `start_session/2` for **both** integrations, the
+`CodingAgent` contract's `run_turn/4` is corrected to match what `Codex.AppServer.run_turn/4` already
+does today: it returns `{:ok, turn_result}` only, with no session value in the return at all. The
+`ClaudeCode.AppServer` implementation returns the same `{:ok, turn_result}` shape — `turn_result` MAY
+carry Claude-Code-specific fields but never a "next session" value, because there is no next session to
+carry. This is the smallest correct fix: it adds no new return arity to the callback, requires no change
+to `AgentRunner`'s existing recursive-call code (which was already, correctly, reusing the original
+`app_session` unconditionally — the code was right; only the contract's prose was wrong), and removes the
+"learn the session id reactively from stream-json output" step entirely, since Symphony already knows the
+ID before turn 1 starts.
+
+**Rationale/evidence**: Unlike the Codex app-server (one long-lived subprocess, one open connection
+reused via JSON-RPC calls into that same live process for every turn), Claude Code's headless mode is one
+full process invocation per turn; continuity across turns is transcript-based (stored under
+`~/.claude/projects/...`) and resumed by session ID, per Claude Code's own session-management
+documentation and confirmed via `claude --help`. This per-turn-process model is exactly the kind of
+provider-specific lifecycle mechanic Principle VI requires to stay localized: `CodingAgent`'s 3-callback
+contract deliberately does not assume "a process is now running" after `start_session`, so this asymmetry
+is fully absorbed inside `ClaudeCode.AppServer` and invisible to `AgentRunner`'s turn loop, which only
+ever sees `{:ok, session}` / `{:ok, turn_result}` / `:ok` — now with `session` genuinely never changing
+after `start_session/2` for either integration, closing the gap instead of routing around it.
+
+**Confidence note**: the exact interaction of `--session-id <uuid>` on a fresh turn 1, followed by
+`--resume <uuid>` on turn 2+, is architecturally sound per the CLI's own documented flag semantics ("Use
+a specific session ID for the conversation" / "Resume a conversation by session ID") and there is no
+plausible alternative reading of those two flags, but it was not exercised against a live turn during
+this planning pass (deliberately — this pass only ran discovery/help-oriented CLI commands, never a real
+prompt) and MUST be confirmed against the installed Claude Code CLI version with one real run at
+implementation time. This is an implementation-time verification item, not a foundational design
+unknown. Separately confirmed and no longer a low-confidence item: `--continue` ("Continue the most
+recent conversation in the current directory") targets "most recent," not an explicit ID, which remains
+the reason it is unsuitable once multiple workspaces/issues run concurrently on one host — `--resume
+<uuid>` is the only one of the two that names an exact session.
 
 ## R8. Claude Code: unattended auto-approval and credential isolation
 
-**Decision**: Launch with a fully-unattended permission mode (Claude Code's documented equivalent of
-"auto-approve for the session," analogous to Codex's `approval_policy` reject-everything default) and
-authenticate via `ANTHROPIC_API_KEY` scoped to the Claude Code subprocess's environment only. Following
-the exact pattern `Codex.AppServer.tracker_secret_unset_command/1` and `tracker_secret_port_env/1`
-already use to strip tracker secrets from the Codex child's environment, the Claude Code launch
-environment explicitly excludes `OPENAI_API_KEY`/Codex's own auth file, and the Codex launch environment
-(unchanged) continues to exclude `ANTHROPIC_API_KEY`.
+**Decision**: Launch with `--permission-mode bypassPermissions` and authenticate via `ANTHROPIC_API_KEY`
+scoped to the Claude Code subprocess's environment only, combined with `--bare` (R5) so Claude Code
+cannot fall back to an interactive OAuth/keychain login even if `ANTHROPIC_API_KEY` were momentarily
+unset — `--bare` makes that failure loud (missing auth surfaces as a launch/attempt failure through
+FR-008.2) instead of silently prompting for a login Symphony can never answer. Following the exact
+pattern `Codex.AppServer.tracker_secret_unset_command/1` and `tracker_secret_port_env/1` already use to
+strip tracker secrets from the Codex child's environment, the Claude Code launch environment explicitly
+excludes `OPENAI_API_KEY`/Codex's own auth file, and the Codex launch environment (unchanged) continues
+to exclude `ANTHROPIC_API_KEY`.
 
 **Rationale/evidence**: FR-009 is a hard requirement ("MUST NOT be required by, or leak into, another
 coding-agent execution integration"). Since FR-010 already guarantees only one coding-agent execution
@@ -186,15 +685,27 @@ credentials from being readable by the *active* one's child process — the exis
 allow-list pattern in `Port.open/2` (already used for tracker secrets) generalizes directly: only pass
 through the environment variables the active integration's profile documents needing.
 
-**Confidence note**: the exact current permission-mode flag/enum name (candidates surfaced during
-research: `--permission-mode bypassPermissions` or `acceptEdits`, possibly combined with
-`--allowedTools`) was not independently re-verified against a live CLI run in this pass and MUST be
-confirmed against the installed Claude Code CLI version's `--help` output during implementation — this
-mirrors how `SPEC.md` §10.5 already requires each Codex-integration implementation to document its own
-chosen approval/sandbox posture rather than the spec prescribing one. Symphony's documented policy
-choice, once confirmed, MUST fail (not silently hang) any turn that still requires interactive
-confirmation, matching the "run MUST NOT stall indefinitely waiting for user input" requirement Codex's
-integration already satisfies.
+**Confirmed this pass** (via `claude --help` on the installed v2.1.245): `--permission-mode` accepts the
+enum `"acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan"` —
+`bypassPermissions` ("Bypass all permission checks. Recommended only for sandboxes with no internet
+access.") is confirmed to exist and is the correct choice here, not a guess: Symphony's per-issue
+workspace isolation (IV-003/IV-006) is exactly the kind of sandboxed, non-interactive context this mode's
+own documented caveat describes, and unlike `acceptEdits`/`dontAsk`/`auto`, it is the only mode
+guaranteed not to fall through to an unanswerable interactive prompt for a non-file-edit action (e.g. a
+shell command) mid-turn. Also confirmed: `code.claude.com/docs/en/headless` documents `ANTHROPIC_API_KEY`
+as the correct unattended-auth environment variable, specifically in combination with `--bare` (R5) —
+"In bare mode, Claude Code never reads OAuth credentials or the system keychain. For the Anthropic API,
+set `ANTHROPIC_API_KEY` in the environment... with a key created in the Claude Console." This directly
+answers the previously-open "is there a way to force API-key-only auth with no OAuth/browser fallback"
+question: `--bare` is that mechanism, not a separate flag. This closes what was previously R8's only
+confidence note — the permission-mode enum value and the auth-isolation mechanism are both now confirmed,
+not assumed. Symphony's documented policy choice MUST still fail (not silently hang) any turn that
+somehow still requires interactive confirmation, matching the "run MUST NOT stall indefinitely waiting
+for user input" requirement Codex's integration already satisfies; `--strict-mcp-config` (confirmed via
+`claude --help`: "Only use MCP servers from `--mcp-config`, ignoring all other MCP configurations") SHOULD
+also be passed so a workspace's own `.mcp.json`, if present, cannot add unreviewed tools to an unattended
+run — this was not in the original plan and is added here as a direct FR-009/credential-isolation
+strengthening enabled by this pass's CLI research.
 
 ## R9. Coding-agent execution integration selection: config surface and reload semantics
 
@@ -207,6 +718,49 @@ currently hardcodes `Codex.AppServer`.
 spec (structural, restart-only selection). No new decision beyond what the spec already settled; captured
 here only to record where in the config pipeline (`Config`/`Config.Schema`, same place `codex.*` is
 resolved today) the field lives.
+
+## R9a. `tracker.provider.path` reload semantics for `tracker.kind: local` (structural exception)
+
+**Decision**: `tracker.provider.path` is a documented, narrow structural exception when
+`tracker.kind: local` — read once at process start alongside `tracker.kind`/`agent_execution.kind`, not
+hot-reloaded — while `tracker.provider.*` remains dynamically reloaded, unchanged, for every other
+tracker kind (`github`/`gitlab`/`jira`/`linear`/`asana`).
+
+**Rationale/evidence**: Confirmed by direct trace that this is a genuine live-behavior hazard, not a
+theoretical one. `WorkflowStore.reload_state/1` (`workflow_store.ex:122-155`) replaces the entire
+`Schema.t()` settings struct wholesale whenever `WORKFLOW.md`'s content hash changes — there is no
+per-field diffing anywhere. `Config.settings!()` (`config.ex:34-43`) always returns whatever
+`WorkflowStore` currently holds, and `Tracker.adapter/0`/`fetch_issues_by_states/1`/`fetch_issues_by_ids/1`
+(`tracker.ex:33-41,87-91`) all call `Config.settings!().tracker` **fresh on every single invocation** —
+there is no snapshot or pinning at the orchestrator-read level (only `Tracker.bind_agent_tools/0` snapshots
+settings, and only for one coding-agent session's own tool calls, not orchestrator-wide reads). Concretely:
+if `tracker.provider.path` changed between two dispatch ticks (within `WorkflowStore`'s 1-second poll
+interval) for a live `tracker.kind: local` deployment, the very next tracker read would transparently
+switch to reading a *different data source's identity* — not new credentials against the same remote
+dataset (which is what a hosted tracker's `provider.*` reload already safely means today), but a
+different local file with different issue IDs. Since the adapter contract already treats "an id present
+in the old fetch but absent from the new fetch" as "no longer visible" (deletion-equivalent, per
+`contracts/local-tracker-adapter.md` §`fetch_issues_by_ids`), a live path switch would make every issue
+from the old file vanish from the orchestrator's perspective mid-flight, misfiring reconciliation's
+stale-dispatch/lost-work handling (`orchestrator.ex:930`) against attempts that are still genuinely
+running. This risk is unique to the local tracker's `path` field specifically — a hosted tracker's
+`provider.*` fields (API key, endpoint, project slug) identify *how to reach the same dataset*, not a
+different dataset's identity, so their existing dynamic-reload behavior stays correct and unchanged.
+
+This is deliberately a single-field carve-out, not a blanket "all `tracker.provider.*` becomes
+restart-only" rule — the review explicitly cautioned against over-broadening this, and there is no
+identified problem with hosted-tracker `provider.*` fields staying dynamically reloadable today.
+
+**Alternatives considered**:
+- *Leave `tracker.provider.path` dynamically reloadable (original plan)* — rejected: demonstrated hazard
+  above.
+- *Make all `tracker.provider.*` fields restart-only, for every tracker kind* — rejected: broader than
+  the identified problem, would regress hosted-tracker operators' ability to rotate credentials/endpoints
+  without a restart, with no requirement in the spec motivating that regression.
+- *Detect a live path change and treat it as a special "migrate to new source" event (re-poll from
+  scratch, reconcile old-path issues as abandoned rather than lost)* — rejected: this is exactly the kind
+  of "live local-store migration/switchover semantics" the review asked to avoid introducing; restart-only
+  is the smallest behavior that avoids needing it at all.
 
 ## R10. Runtime/telemetry field reuse (no rename)
 
@@ -222,3 +776,44 @@ explicitly does not require identical telemetry *shape*; Constitution Principle 
 weighs against a rename sweep across three files and their tests for a purely cosmetic improvement. This
 is recorded as a conscious, reversible naming choice, not an oversight — a future rename remains open if
 a third integration makes the Codex-specific naming genuinely confusing.
+
+## R11. Local tracker `dispatchable` semantics (no invented "archived"/"withdrawn" concept)
+
+**Decision (corrected)**: The local tracker's `IssueRecord` normalizes `dispatchable: true`
+unconditionally on every record — there is no `archived`/`withdrawn` field, no operator/tool mechanism to
+set one, and no plan to add one.
+
+**Prior plan's gap**: the original data-model.md described `dispatchable` as "`true` unless the
+operator/tool explicitly sets an `archived`/withdrawn record" without the on-disk schema anywhere in the
+same document defining an `archived` field or any mutation path that could set it — an undefined
+provider-side eligibility concept referenced but never specified.
+
+**Rationale/evidence**: Confirmed by reading every adapter's actual `dispatchable` computation
+(`gitlab/client.ex:198`, `github/client.ex:199`, `asana/client.ex:223`, `linear/client.ex:484,496-500`,
+`jira/client.ex:254,337-347`) that `dispatchable` is not a uniform "is this archived" flag anywhere in
+the current codebase — it is each adapter's own encoding of *structural* eligibility particular to that
+provider's data shape: GitHub excludes pull requests (`not Map.has_key?(issue, "pull_request")`), Asana
+excludes sections and completed tasks, Linear/Jira fold in assignee-filtering and blocked-before-dispatch
+gating. **GitLab has no structural exclusion need and hardcodes `dispatchable: true` unconditionally**
+(`gitlab/client.ex:198`) — this is the exact, already-existing precedent for the local tracker, which
+likewise has no PR/section/completed-task-shaped structural category to exclude (every record in the
+local store is, by construction, "a real work item"). Separately confirmed: no `archived`/`withdrawn`/
+`soft_delete` concept exists anywhere in the codebase (verified by grep across `lib/symphony_elixir/`),
+and the gating the local `IssueRecord` genuinely needs — "should this record currently be worked" — is
+already fully covered by two mechanisms this data model already has: `state` (matched against
+`tracker.active_states`/`terminal_states`, exactly like every adapter) and `blocked_by`, which the
+orchestrator already reads directly and independently of `dispatchable`
+(`orchestrator.ex:930`'s stale-dispatch-after-refresh check). If an operator wants to stop Symphony from
+touching a local-tracker record, the existing, uniform lever every other adapter already exposes is to
+move it to a terminal state — no new mechanism is needed or justified.
+
+**Alternatives considered**:
+- *Add an `archived` boolean field with an operator-facing toggle* — rejected: this is inventing local
+  lifecycle functionality merely to populate a field description that never needed to say anything other
+  than "always true," which the review's own guidance explicitly warns against ("prefer not to invent
+  one" absent a concrete inherited requirement — none was found).
+- *Derive `dispatchable` from some other local-only heuristic (e.g. record age, last-touched timestamp)*
+  — rejected: no requirement (FR/SC) motivates it, and it would silently exclude legitimate work items
+  for reasons an operator did not ask for, unlike every other adapter's `dispatchable` rule, which encodes
+  an actual structural fact about the provider's data (not a policy the local tracker has any basis to
+  invent on Symphony's behalf).
