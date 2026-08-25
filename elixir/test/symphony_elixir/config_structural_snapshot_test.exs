@@ -10,6 +10,7 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
 
     assert Config.structural_settings!().tracker_kind == "linear"
     assert Tracker.adapter() == LinearAdapter
+    assert Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
@@ -17,10 +18,15 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
     assert Config.structural_settings!().tracker_kind == "linear"
     assert Tracker.adapter() == LinearAdapter
 
+    assert Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"],
+           "the pinned Linear adapter must keep requiring LINEAR_API_KEY until an actual restart, " <>
+             "even though the live-reloaded tracker.kind already reads \"memory\""
+
     restart_workflow_store!()
 
     assert Config.structural_settings!().tracker_kind == "memory"
     assert Tracker.adapter() == Memory
+    assert Tracker.bind_agent_tools().secret_environment_names == []
   end
 
   test "a non-tracker.kind dynamic field still reloads live without a restart" do

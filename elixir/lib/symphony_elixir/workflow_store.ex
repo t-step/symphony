@@ -151,8 +151,13 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
+  # Threads the already-pinned tracker_kind through so Schema.parse/2's kind-dependent
+  # normalization (Linear secret resolution, active/terminal state defaults) stays keyed off
+  # the structural pin rather than whatever tracker.kind this reload just read live — otherwise
+  # a live tracker.kind edit could change the still-pinned adapter's effective settings before
+  # a restart, even though adapter() itself correctly stays pinned.
   defp reload_path(path, state) do
-    case load_state(path) do
+    case load_state(path, state.structural.tracker_kind) do
       {:ok, new_state} ->
         {:ok, %{new_state | structural: state.structural}}
 
@@ -176,9 +181,9 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
-  defp load_state(path) do
+  defp load_state(path, structural_tracker_kind \\ nil) do
     with {:ok, workflow} <- Workflow.load(path),
-         {:ok, settings} <- Schema.parse(workflow.config),
+         {:ok, settings} <- Schema.parse(workflow.config, structural_tracker_kind),
          :ok <- Config.validate_settings(settings),
          {:ok, stamp} <- current_stamp(path) do
       {:ok, %State{path: path, stamp: stamp, workflow: workflow, settings: settings}}

@@ -301,8 +301,25 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
-  @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
-  def parse(config) when is_map(config) do
+  @doc """
+  Parses raw `WORKFLOW.md` config into validated settings.
+
+  `structural_tracker_kind`, when given, is the caller's structurally-pinned
+  (restart-only) `tracker.kind` (IV-005; research.md R9). Kind-dependent
+  normalization below (Linear secret resolution, active/terminal state
+  defaults) is keyed off this value instead of the freshly-parsed `config`'s
+  own `tracker.kind`, so that a live `WORKFLOW.md` edit to `tracker.kind`
+  cannot change how the still-active (pinned) tracker adapter's settings are
+  normalized before a restart. `settings.tracker.kind` itself is left
+  reflecting the live parsed value, unaffected by this parameter — only the
+  kind-branch *decisions* inside `finalize_settings/2` are pinned. Omitted
+  (`nil`) when no pin exists yet — e.g. the very first parse on process
+  start, or a direct call with the process not running — in which case the
+  freshly-parsed `config`'s own `tracker.kind` is used, which is exactly the
+  value about to become the new pin.
+  """
+  @spec parse(map(), String.t() | nil) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
+  def parse(config, structural_tracker_kind \\ nil) when is_map(config) do
     config
     |> normalize_keys()
     |> drop_nil_values()
@@ -310,7 +327,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        {:ok, finalize_settings(settings, structural_tracker_kind)}
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -395,11 +412,12 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
-  defp finalize_settings(settings) do
+  defp finalize_settings(settings, structural_tracker_kind) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
+    effective_kind = effective_tracker_kind(structural_tracker_kind, settings.tracker.kind)
 
     {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
+      case effective_kind do
         "linear" ->
           linear_provider =
             provider
@@ -426,7 +444,7 @@ defmodule SymphonyElixir.Config.Schema do
       end
 
     {active_states, terminal_states} =
-      case settings.tracker.kind do
+      case effective_kind do
         kind when kind in ["linear", "memory"] ->
           {
             settings.tracker.active_states || @linear_active_states,
@@ -462,6 +480,9 @@ defmodule SymphonyElixir.Config.Schema do
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
   end
+
+  defp effective_tracker_kind(nil, live_kind), do: live_kind
+  defp effective_tracker_kind(structural_tracker_kind, _live_kind), do: structural_tracker_kind
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->
