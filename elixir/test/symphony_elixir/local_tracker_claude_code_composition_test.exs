@@ -20,6 +20,19 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   `tools/call` for `local_tracker_set_state` against that URL — the same structural path the real
   `claude` CLI's MCP client would take. Mutation is verified by reading
   `.symphony/local_tracker.json` directly off disk, never by trusting the run's reported success.
+
+  Also covers T033 (quickstart.md Scenario 2 step 7; research.md R6a's per-run isolation): two
+  concurrent `claude_code`-backed runs, driven by real `AgentRunner.run/3` dispatches against two
+  distinct `tracker.kind: local` issues sharing the same on-disk store, each with its own
+  fake-`claude` fixture instance scripted (not LLM-instructed) to call `local_tracker_set_state`
+  against its own bound issue only. Overlap is forced with an explicit barrier/marker-file
+  handshake (not a blind sleep): each fixture leaks its run's real generated MCP URL to a shared
+  directory and then blocks on a `go` marker the test only writes once both runs' endpoints are
+  observed live, so the test's own cross-token HTTP checks are guaranteed to run while both
+  listeners are actually up. This mirrors `claude_code_mcp_server_test.exs`'s unit-level
+  "cross-run isolation" describe block, but exercises it at full composition scope through the
+  real `AgentRunner.run/3` -> `ClaudeCode.AppServer` -> `MCPServer` -> `Local.Store` path instead
+  of constructing `MCPServer` instances directly.
   """
 
   use SymphonyElixir.TestSupport
@@ -27,6 +40,8 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   alias SymphonyElixir.Local.Init, as: LocalInit
 
   @issue_id "composition-1"
+  @issue_id_a "composition-concurrent-a"
+  @issue_id_b "composition-concurrent-b"
 
   setup do
     test_root =
@@ -115,6 +130,86 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     assert on_disk_record["identifier"] == @issue_id
   end
 
+  test "two concurrent claude_code-backed local-tracker runs remain isolated across MCP bindings",
+       %{test_root: test_root, data_path: data_path, workspace_root: workspace_root, fake_claude: fake_claude} do
+    barrier_dir = Path.join(test_root, "barrier")
+    File.mkdir_p!(barrier_dir)
+
+    write_fake_claude_concurrent_isolation!(fake_claude, barrier_dir)
+
+    assert {:ok, :initialized} = LocalInit.run(data_path)
+    seed_two_dispatchable_issues!(data_path, @issue_id_a, @issue_id_b)
+
+    write_local_claude_workflow!(Workflow.workflow_file_path(), data_path, workspace_root, fake_claude,
+      max_concurrent_agents: 2,
+      turn_timeout_ms: 20_000
+    )
+
+    restart_workflow_store!()
+
+    assert {:ok, [%Issue{state: "todo"} = issue_a]} = Tracker.fetch_issues_by_ids([@issue_id_a])
+    assert {:ok, [%Issue{state: "todo"} = issue_b]} = Tracker.fetch_issues_by_ids([@issue_id_b])
+
+    test_pid = self()
+
+    task_a = Task.async(fn -> AgentRunner.run(issue_a, test_pid, max_turns: 1) end)
+    task_b = Task.async(fn -> AgentRunner.run(issue_b, test_pid, max_turns: 1) end)
+
+    leak_a = Path.join(barrier_dir, "#{@issue_id_a}.leak")
+    leak_b = Path.join(barrier_dir, "#{@issue_id_b}.leak")
+
+    # Explicit barrier handshake (not a sleep-and-hope): block until BOTH fixtures have leaked
+    # their run's real generated MCP endpoint, so both listeners are provably alive and
+    # concurrently in flight before the cross-token checks below run against them.
+    {url_a, url_b} = await_both_leaked!(leak_a, leak_b)
+
+    {port_a, token_a} = parse_mcp_url(url_a)
+    {port_b, token_b} = parse_mcp_url(url_b)
+
+    refute port_a == port_b, "expected each concurrent run to bind a distinct MCP listener port"
+    refute token_a == token_b, "expected each concurrent run to mint a distinct per-run MCP bearer token"
+
+    # Composition-scope mirror of claude_code_mcp_server_test.exs's unit-level "cross-run
+    # isolation" check (T021): run A's token against run B's live port, and vice versa, is
+    # rejected -- proven against the real endpoints this dispatch generated, while both runs are
+    # still overlapping in flight.
+    assert cross_token_request(port_b, token_a).status == 401,
+           "run A's token must be rejected by run B's live MCP listener"
+
+    assert cross_token_request(port_a, token_b).status == 401,
+           "run B's token must be rejected by run A's live MCP listener"
+
+    # Release both fixtures to perform their own scripted mutation and complete the turn.
+    File.write!(Path.join(barrier_dir, "go"), "go")
+
+    assert :ok = Task.await(task_a, 20_000)
+    assert :ok = Task.await(task_b, 20_000)
+
+    lifecycle_events_a = drain_lifecycle_events(@issue_id_a)
+    lifecycle_events_b = drain_lifecycle_events(@issue_id_b)
+
+    for {issue_id, lifecycle_events} <- [{@issue_id_a, lifecycle_events_a}, {@issue_id_b, lifecycle_events_b}] do
+      assert Enum.any?(lifecycle_events, &(&1.event == :turn_completed)),
+             "expected #{issue_id}'s run to reach a terminal turn_completed lifecycle event, got: #{inspect(lifecycle_events)}"
+    end
+
+    on_disk_issues =
+      data_path
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.fetch!("issues")
+
+    record_a = Map.fetch!(on_disk_issues, @issue_id_a)
+    record_b = Map.fetch!(on_disk_issues, @issue_id_b)
+
+    # Each issue received only its own run's mutation -- no cross-binding occurred.
+    assert record_a["state"] == "in_progress-#{@issue_id_a}"
+    assert record_a["identifier"] == @issue_id_a
+
+    assert record_b["state"] == "in_progress-#{@issue_id_b}"
+    assert record_b["identifier"] == @issue_id_b
+  end
+
   defp seed_dispatchable_issue!(data_path) do
     File.write!(
       data_path,
@@ -131,7 +226,10 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     )
   end
 
-  defp write_local_claude_workflow!(path, data_path, workspace_root, fake_claude) do
+  defp write_local_claude_workflow!(path, data_path, workspace_root, fake_claude, opts \\ []) do
+    max_concurrent_agents = Keyword.get(opts, :max_concurrent_agents, 1)
+    turn_timeout_ms = Keyword.get(opts, :turn_timeout_ms, 10_000)
+
     File.write!(
       path,
       """
@@ -145,19 +243,32 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
       workspace:
         root: #{Jason.encode!(workspace_root)}
       agent:
-        max_concurrent_agents: 1
+        max_concurrent_agents: #{max_concurrent_agents}
         max_turns: 1
       agent_execution:
         kind: claude_code
       claude_code:
         command: #{Jason.encode!(fake_claude)}
         read_timeout_ms: 5000
-        turn_timeout_ms: 10000
+        turn_timeout_ms: #{turn_timeout_ms}
       observability:
         dashboard_enabled: false
       ---
       Resolve the assigned work item.
       """
+    )
+  end
+
+  defp seed_two_dispatchable_issues!(data_path, id_a, id_b) do
+    File.write!(
+      data_path,
+      Jason.encode!(%{
+        "format_version" => 1,
+        "issues" => %{
+          id_a => %{"state" => "todo", "identifier" => id_a, "title" => "Concurrent isolation A"},
+          id_b => %{"state" => "todo", "identifier" => id_b, "title" => "Concurrent isolation B"}
+        }
+      })
     )
   end
 
@@ -206,6 +317,87 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     """)
 
     File.chmod!(path, 0o755)
+  end
+
+  # Drives the same real MCP-client role as `write_fake_claude_mcp_tool_call!/1` (locates its own
+  # `--mcp-config` argv value, extracts the real ephemeral `symphony_tracker` URL), but is shared
+  # by BOTH concurrent runs in the isolation test -- `claude_code.command` is one process-wide
+  # config value, so both runs launch the identical fixture file. Each invocation tells itself
+  # apart from the other using `$PWD`'s basename: `Workspace.workspace_key/1` returns the issue
+  # identifier verbatim for these ASCII-safe test ids, so each run's working directory is already
+  # named after its own bound issue -- no custom env var is available to thread through, since
+  # `ClaudeCode.AppServer.claude_subprocess_env/0` strips every environment variable off the
+  # allow-list before the subprocess launches. Before performing its own scripted mutation, each
+  # invocation leaks its real generated MCP URL to `barrier_dir/<run_key>.leak` and then blocks
+  # (bounded, not indefinitely) on a `barrier_dir/go` marker -- the explicit handshake the test
+  # uses to guarantee both listeners are observed live and overlapping before either mutates.
+  defp write_fake_claude_concurrent_isolation!(path, barrier_dir) do
+    File.write!(path, """
+    #!/bin/sh
+    RUN_KEY=$(basename "$PWD")
+
+    printf '{"type":"system","subtype":"init","session_id":"composition-fixture-%s"}\\n' "$RUN_KEY"
+
+    MCP_CONFIG_PATH=""
+    FOUND_FLAG=0
+    for arg in "$@"; do
+      if [ "$FOUND_FLAG" = "1" ]; then
+        MCP_CONFIG_PATH="$arg"
+      fi
+      if [ "$arg" = "--mcp-config" ]; then
+        FOUND_FLAG=1
+      fi
+    done
+
+    MCP_URL=$(sed -n 's/.*"url":"\\([^"]*\\)".*/\\1/p' "$MCP_CONFIG_PATH")
+
+    printf '%s' "$MCP_URL" > "#{barrier_dir}/$RUN_KEY.leak"
+
+    GO_FILE="#{barrier_dir}/go"
+    i=0
+    while [ ! -f "$GO_FILE" ] && [ "$i" -lt 150 ]; do
+      i=$((i + 1))
+      sleep 0.05
+    done
+
+    curl -s -o /dev/null -X POST "$MCP_URL" \\
+      -H 'Content-Type: application/json' \\
+      -d "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"tools/call\\",\\"params\\":{\\"name\\":\\"local_tracker_set_state\\",\\"arguments\\":{\\"state\\":\\"in_progress-$RUN_KEY\\"}}}"
+
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+    """)
+
+    File.chmod!(path, 0o755)
+  end
+
+  # Bounded poll (not an indefinite/blind sleep) for both fixtures' barrier leak files to appear.
+  # This is the test side of the leak-file/`go`-marker handshake documented on
+  # `write_fake_claude_concurrent_isolation!/2`.
+  defp await_both_leaked!(leak_a, leak_b, attempts \\ 150)
+
+  defp await_both_leaked!(_leak_a, _leak_b, 0) do
+    flunk("timed out waiting for both fake-claude fixtures to leak their MCP endpoint")
+  end
+
+  defp await_both_leaked!(leak_a, leak_b, attempts) do
+    if File.exists?(leak_a) and File.exists?(leak_b) do
+      {File.read!(leak_a) |> String.trim(), File.read!(leak_b) |> String.trim()}
+    else
+      Process.sleep(20)
+      await_both_leaked!(leak_a, leak_b, attempts - 1)
+    end
+  end
+
+  defp parse_mcp_url(url) do
+    uri = URI.parse(url)
+    token = String.trim_leading(uri.path, "/mcp/")
+    {uri.port, token}
+  end
+
+  defp cross_token_request(port, token) do
+    Req.post!("http://127.0.0.1:#{port}/mcp/#{token}",
+      json: %{"jsonrpc" => "2.0", "id" => 99, "method" => "tools/list"}
+    )
   end
 
   defp drain_lifecycle_events(issue_id), do: drain_lifecycle_events(issue_id, [])
