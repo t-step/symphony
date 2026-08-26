@@ -892,3 +892,81 @@ output.
   terminal event; their failure-case values are not.
 
 No other planning artifact was changed by this addendum, per T016's scope.
+
+## R6/R6a/R7 Addendum (2026-08-26): T022/T023 live CLI + real MCP-tool-call verification (installed v2.1.246)
+
+**Scope**: T022's mandatory pre-completion smoke verification — the previous addendum's live turn triggered
+no tool use, so the MCP tool-call path (T020/T021's own module, exercised for real through T022's actual
+`ClaudeCode.AppServer`-shaped wiring) and `--resume` continuation were still unobserved. This pass ran two
+non-committed scratch scripts (not part of the test suite, not committed) against the real installed CLI:
+(1) a real `SymphonyElixir.ClaudeCode.MCPServer` bound to a real, established `Local.Store`/`Local.Adapter`
+tracker with one seeded issue, a real `--mcp-config` file pointing at it, and one `claude -p` turn instructed
+to call `local_tracker_set_state`; (2) a follow-up `claude --resume <same-uuid>` turn against the same
+session id (no MCP config needed for this one — its only purpose was observing resume continuity).
+
+**Tool-call path fully confirmed working end to end, for real** — not simulated: the live `claude` process
+made a real MCP HTTP call to Symphony's own `ClaudeCode.MCPServer`/`Tracker.execute_bound_agent_tool/4`/
+`Local.AgentTool`/`Local.Store` chain, and the target issue's `state` was independently re-read via
+`Local.Adapter.fetch_issues_by_ids/1` afterward and confirmed changed from `"todo"` to `"done"` — proof the
+call landed on real state, not just that the CLI printed something. This validates R6/R6a's central
+architectural bet (MCP tool calls are an out-of-band HTTP channel entirely independent of the `stream-json`
+stdout stream) with a real tool invocation, not just the no-tool-use turn the prior addendum had.
+
+**`--resume <uuid>` continuation confirmed** (closes R7's last open item): a second `claude` process launched
+with `--resume <same session_id>` (no `--session-id`) echoed the identical `session_id` on every event
+(`system/init` included — a resumed turn still emits `system/init`, contrary to a plausible guess that it
+might not) and correctly retained conversational context (asked to "reply with exactly: RESUMED", it did,
+proving the resumed turn saw the first turn's history). No corrections needed to T022's implementation, which
+already treats `system/init` identically regardless of first-turn-vs-resume.
+
+**New real event shapes observed, none requiring a parser change** (`ClaudeCode.AppServer`'s `run_turn/4`
+already tolerates every one of these via its generic `%{"type" => type}` fallback branch, which forwards an
+unrecognized-but-well-formed event as a `:notification` and keeps reading — confirmed by this run producing
+zero parser errors/crashes end to end):
+
+- `system` subtype `status` recurs multiple times per turn (once per model round-trip, not once at start as
+  the prior addendum's simpler no-tool-use turn suggested).
+- `system` subtype `thinking_tokens` — new, appears during extended-thinking generation; not previously
+  observed since the prior verification prompt did not trigger visible thinking.
+- A new top-level `"type": "user"` event — Claude Code's synthetic representation of an MCP tool's result
+  fed back into the model's own context, shaped as `{"type":"user","message":{"role":"user","content":
+  [{"type":"tool_result","tool_use_id":...,"content":[...]}]},"tool_use_result":...}`. Two shapes of this
+  were observed in one run: one whose `content` was a client-side `tool_reference`/tool-selection artifact
+  (`{"type":"tool_reference","tool_name":"mcp__symphony_tracker__local_tracker_set_state"}` — Claude Code
+  appears to resolve an MCP tool by name via an internal deferred-tool-selection step before the real
+  `tool_use` call, mechanically analogous to this very session's own `ToolSearch` deferred-tool pattern, but
+  this is entirely internal to the CLI/model loop and never reaches Symphony's MCP server as a distinct wire
+  call), and one whose `content` carried the tool's real return value (the exact JSON
+  `Local.AgentTool.execute_agent_tool/3` returns, e.g. `{"state":"done","updated_at":"..."}` as a `text`
+  content block) — confirming the tool's actual output round-trips back to the model unmodified.
+- `stream_event` wrapping `content_block_start` with `content_block.type: "tool_use"` — the streaming
+  representation of the model deciding to call a tool. Confirmed present, and confirmed **not needed** by
+  `run_turn/4`: the tool call itself is fully resolved by the MCP HTTP round trip (T020/T021's own module),
+  never by anything read off the `stream-json` stdout Port.
+- The terminal `result` event's exact shape was re-confirmed unchanged from the prior addendum:
+  `is_error: false`, `subtype: "success"`, `result: "<the literal final-turn text}"`, `session_id`, plus a
+  large amount of additional cost/usage/telemetry detail (`usage`, `modelUsage`, `total_cost_usd`,
+  `subagent_stats`, etc.) that `ClaudeCode.AppServer` does not currently read (kept as the full raw payload
+  under `turn_result.raw`/the `:turn_completed` message's `raw` field for any future consumer, not parsed
+  field-by-field, matching the "small parsing functions" / "don't parse what isn't needed yet" guidance).
+
+**New, non-blocking observation (latency, not correctness)**: the installed CLI prints (to its own stderr,
+confirmed distinct from the `stream-json` stdout Symphony reads) `"Warning: no stdin data received in 3s,
+proceeding without it"` when launched with an open-but-unused stdin pipe — which is exactly how `Port.open/2`
+leaves stdin by default when the caller never writes to or closes it, as `ClaudeCode.AppServer.run_turn/4`
+does today. This adds a fixed ~3s delay to every real turn's startup and is unrelated to `-p`'s own prompt
+argument (already passed positionally, not via stdin) — it appears to be a generic "wait briefly in case a
+caller pipes additional prompt content" heuristic. Not fixed in this session: closing/redirecting a `Port`'s
+stdin independently of the whole port has no portable, non-shell-string mechanism in vanilla Erlang, and a
+~3s fixed cost is a rounding error against a real coding-agent turn's overall runtime (T022/T023's own scope
+is correctness, not this class of latency micro-optimization) — flagged here for T027+ to reconsider if it
+ever becomes material (e.g. `< /dev/null` if a structured-argv-preserving redirect approach is found).
+
+**Still open / not exercised by this pass** (unchanged from the prior addendum, and not attempted here per
+the explicit "do not fake certainty" instruction — inducing a genuine `is_error:true` terminal event would
+require either a real model/API failure or a permission-mode change away from `bypassPermissions`, neither
+of which is safe or deterministic to manufacture in a live smoke check): the failure-path `result` shape
+(`is_error:true`) remains fixture-only, covered only by `claude_code_app_server_test.exs`'s synthetic
+`:failure_result`/`:malformed_result` fixtures, not the real CLI.
+
+No other planning artifact was changed by this addendum, per T022/T023's scope.
