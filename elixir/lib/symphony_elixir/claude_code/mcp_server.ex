@@ -58,9 +58,23 @@ defmodule SymphonyElixir.ClaudeCode.MCPServer do
 
     plug_state = %{tracker_binding: tracker_binding, issue: issue, token: token}
 
-    case Bandit.start_link(plug: {__MODULE__, plug_state}, ip: ip, port: port, startup_log: false) do
+    case start_bandit(plug_state, ip, port) do
       {:ok, pid} -> {:ok, %{pid: pid, port: bound_port(pid), token: token}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A failed `Bandit.start_link/1` (e.g. `:eaddrinuse`) delivers its failure as a raw
+  # linked-process `:EXIT` signal rather than a plain `{:error, reason}` return unless the
+  # calling process is trapping exits — without this, a non-trapping caller crashes instead
+  # of receiving the `{:error, term()}` this function's own spec promises.
+  defp start_bandit(plug_state, ip, port) do
+    was_trapping_exits? = Process.flag(:trap_exit, true)
+
+    try do
+      Bandit.start_link(plug: {__MODULE__, plug_state}, ip: ip, port: port, startup_log: false)
+    after
+      Process.flag(:trap_exit, was_trapping_exits?)
     end
   end
 
