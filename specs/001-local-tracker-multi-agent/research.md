@@ -817,3 +817,78 @@ move it to a terminal state — no new mechanism is needed or justified.
   for reasons an operator did not ask for, unlike every other adapter's `dispatchable` rule, which encodes
   an actual structural fact about the provider's data (not a policy the local tracker has any basis to
   invent on Symphony's behalf).
+
+## R5/R7 Addendum (2026-08-25): T016 live CLI verification (installed v2.1.246)
+
+**Scope**: T016's implementation-time verification of the CLI flags and stream-json event-type names
+R5/R7/R8 flagged as not yet exercised against a live run. Performed via `claude --help` on the installed
+CLI (v2.1.246 — one patch ahead of the v2.1.245 the prior planning pass used; no flag differences observed
+for the items below) plus one real `claude -p` turn.
+
+**All six previously-flagged flags reconfirmed present with the documented semantics, unchanged from the
+prior pass's `--help` reading**: `--session-id <uuid>` ("Use a specific session ID for the conversation
+(must be a valid UUID)"), `--resume [value]` / `-r` ("Resume a conversation by session ID, or open
+interactive picker with optional search term"), `--output-format stream-json` (one of `text`/`json`/
+`stream-json`), `--verbose`, `--include-partial-messages` (gated to `--print` + `stream-json`),
+`--permission-mode bypassPermissions` (one of the documented six-value enum), `--bare` (auth strictly
+`ANTHROPIC_API_KEY`/`apiKeyHelper`; OAuth/keychain never read), `--strict-mcp-config` ("Only use MCP
+servers from `--mcp-config`, ignoring all other MCP configurations"). No corrections needed to R5/R8's
+existing text.
+
+**Live turn**: `claude -p "Reply with exactly the word: pong" --session-id <uuid> --output-format
+stream-json --verbose --include-partial-messages --permission-mode bypassPermissions --strict-mcp-config
+--no-session-persistence`, run in a scratch directory outside this repo. **Not** run with `--bare`, because
+the verification environment authenticates via the caller's existing Claude subscription session
+(`"apiKeySource":"none"` in the captured `system/init` event), not a standalone `ANTHROPIC_API_KEY` —
+`--bare` would have failed auth in that environment per its own documented behavior. This is a limitation
+of the verification environment, not a finding about production behavior; Symphony's actual launches
+(which always pass `--bare` per R5/R8) are expected to additionally skip the `hook_started`/`hook_response`
+system-subtype events seen below, since `--bare`'s documented scope explicitly includes "skip hooks" and
+those events are traced to the verification caller's own user-level `SessionStart` hooks, not anything
+Claude Code emits unconditionally.
+
+**Captured top-level `"type"` values** (this is the actual event-name answer R5's confidence note asked
+for), in emission order for one no-tool-use turn:
+
+1. `system` (subtype `hook_started` / `hook_response`, one pair per configured `SessionStart` hook —
+   verification-environment artifact per above, not expected under `--bare`)
+2. `system` (subtype `init`) — the session-start signal: carries `session_id`, `cwd`, `tools`,
+   `mcp_servers`, `model`, `permissionMode`, `apiKeySource`, `claude_code_version`, among others. This is
+   the natural analogue of Codex's session-start signal and the event T022's `on_message` should treat as
+   `session_started`.
+3. `system` (subtype `status`, `"status":"requesting"`) — turn-in-progress marker.
+4. `stream_event` (repeated) — wraps the raw Anthropic Messages API streaming events verbatim in an
+   `event` field: observed `message_start`, `content_block_start`, `content_block_delta` (with
+   `delta.type:"text_delta"`), `content_block_stop`, `message_delta`, `message_stop`. This confirms R5's
+   assumption that Claude Code's stream-json transport is "one JSON object per line" and additionally shows
+   the streaming payload is the *unmodified* Anthropic Messages API stream shape, not a Claude-Code-specific
+   re-encoding — useful if `run_turn/4`'s parser wants incremental text deltas.
+5. `assistant` — one per complete assistant message, carrying the full non-streaming `message` object
+   (role/content/usage). Redundant with the `stream_event` deltas for text-only turns; gives the complete
+   message in one event without reassembling deltas.
+6. `rate_limit_event` — rate-limit/usage-window status, unrelated to turn outcome.
+7. `result` — **the terminal per-turn outcome event** (the direct analogue of Codex's `turn/completed`/
+   `turn/failed` R5's confidence note asked about): `{"type":"result","subtype":"success","is_error":false,
+   "result":"<final text>","session_id":...,"usage":...,"total_cost_usd":...,"num_turns":...,
+   "stop_reason":"end_turn","duration_ms":...,"duration_api_ms":...,"permission_denials":[],
+   "terminal_reason":"completed",...}`. `is_error`/`subtype` together encode success vs. failure; this is
+   the single event `run_turn/4`'s parser should key off to resolve `{:ok, turn_result}`.
+
+**Confirms R7's core mechanism**: the caller-supplied `--session-id` UUID is echoed back unchanged on every
+single event (`system/init`, every `stream_event`, `assistant`, `result`) — Symphony can generate and rely
+on its own session UUID up front exactly as R7 decided, with nothing to learn reactively from turn 1's
+output.
+
+**Still open / not exercised by this pass** (narrower than before, but not fully closed):
+- **`--resume <uuid>` turn-to-turn continuation** (R7's confidence note) was not exercised — only one
+  `--session-id` turn was run, no follow-up `--resume` turn. Turn 1's session-identity mechanism is now
+  confirmed; the turn-2+ resume path is not.
+- **Tool-call event shapes** (a `tool_use` content block / its `stream_event` deltas, and however a tool
+  result is threaded back as a `user`-role message) were not observed, because this verification prompt
+  intentionally triggered no tool use. T020/T021/T022's MCP tool-call path will need this captured against
+  a turn that actually invokes a tool — deferred to that implementation work rather than guessed here.
+- **Failure-path `result` shape** (`is_error:true` / a non-`"success"` `subtype`) was not observed, since
+  the one live turn succeeded. The field names above (`is_error`, `subtype`) are confirmed to exist on the
+  terminal event; their failure-case values are not.
+
+No other planning artifact was changed by this addendum, per T016's scope.
