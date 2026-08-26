@@ -210,6 +210,98 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     assert record_b["identifier"] == @issue_id_b
   end
 
+  test "SC-004 equivalence: scheduler dispatch order, concurrency-limit enforcement, and retry/backoff decisions match between local+claude_code and memory+codex given equivalent normalized inputs",
+       %{data_path: data_path, workspace_root: workspace_root, fake_claude: fake_claude} do
+    assert {:ok, :initialized} = LocalInit.run(data_path)
+
+    normalized_issues = [
+      %Issue{
+        id: "sc004-low",
+        identifier: "SC004-3",
+        title: "Lower priority, newest",
+        state: "todo",
+        priority: 3,
+        dispatchable: true,
+        created_at: ~U[2026-01-03 00:00:00Z]
+      },
+      %Issue{
+        id: "sc004-high-older",
+        identifier: "SC004-1",
+        title: "High priority, older",
+        state: "todo",
+        priority: 1,
+        dispatchable: true,
+        created_at: ~U[2026-01-01 00:00:00Z]
+      },
+      %Issue{
+        id: "sc004-high-newer",
+        identifier: "SC004-2",
+        title: "High priority, newer",
+        state: "todo",
+        priority: 1,
+        dispatchable: true,
+        created_at: ~U[2026-01-02 00:00:00Z]
+      }
+    ]
+
+    expected_dispatch_order = ["SC004-1", "SC004-2", "SC004-3"]
+
+    # Reloads a real deployment config for each side, then drives the actual production
+    # `Orchestrator` dispatch-order/eligibility functions (`sort_issues_for_dispatch_for_test`,
+    # `should_dispatch_issue_for_test` -- the same real, non-stubbed functions
+    # `workspace_and_config_test.exs` already treats as the boundary for this behavior) against
+    # identical normalized `Issue` inputs under each live config.
+    local_results =
+      reload_local_claude_deployment!(data_path, workspace_root, fake_claude, fn ->
+        collect_scheduler_observables(normalized_issues)
+      end)
+
+    reference_results =
+      reload_memory_codex_deployment!(fn ->
+        collect_scheduler_observables(normalized_issues)
+      end)
+
+    assert local_results.dispatch_order == expected_dispatch_order,
+           "expected local+claude_code dispatch order to match priority/created_at ordering, got: #{inspect(local_results.dispatch_order)}"
+
+    assert reference_results.dispatch_order == expected_dispatch_order,
+           "expected memory+codex dispatch order to match priority/created_at ordering, got: #{inspect(reference_results.dispatch_order)}"
+
+    assert local_results.dispatch_order == reference_results.dispatch_order,
+           "expected dispatch order to be identical across tracker/agent-execution kinds given equivalent normalized inputs"
+
+    assert local_results.eligible_with_free_slot? == true
+    assert reference_results.eligible_with_free_slot? == true
+
+    assert local_results.eligible_with_free_slot? == reference_results.eligible_with_free_slot?,
+           "expected concurrency-limit enforcement to agree with a free slot"
+
+    assert local_results.eligible_with_slot_taken? == false
+    assert reference_results.eligible_with_slot_taken? == false
+
+    assert local_results.eligible_with_slot_taken? == reference_results.eligible_with_slot_taken?,
+           "expected concurrency-limit enforcement to agree once the single slot is occupied"
+
+    # Retry/backoff decision equivalence, driven through the real `Orchestrator` GenServer's
+    # `handle_info({:DOWN, ...})` boundary (not stubbed) under each live deployment -- mirrors
+    # core_test.exs's kind-agnostic "normal worker exit schedules active-state continuation
+    # retry" reference case.
+    local_retry =
+      reload_local_claude_deployment!(data_path, workspace_root, fake_claude, fn ->
+        capture_retry_decision!(Module.concat(__MODULE__, :SC004LocalRetryOrchestrator))
+      end)
+
+    reference_retry =
+      reload_memory_codex_deployment!(fn ->
+        capture_retry_decision!(Module.concat(__MODULE__, :SC004MemoryRetryOrchestrator))
+      end)
+
+    assert local_retry.attempt == reference_retry.attempt
+
+    assert_due_in_range(local_retry.due_at_ms, 500, 1_100)
+    assert_due_in_range(reference_retry.due_at_ms, 500, 1_100)
+  end
+
   defp seed_dispatchable_issue!(data_path) do
     File.write!(
       data_path,
@@ -398,6 +490,105 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     Req.post!("http://127.0.0.1:#{port}/mcp/#{token}",
       json: %{"jsonrpc" => "2.0", "id" => 99, "method" => "tools/list"}
     )
+  end
+
+  # Reloads a real `tracker.kind: local` + `agent_execution.kind: claude_code` deployment
+  # (T034/SC-004's comparison side) and runs `fun` against it.
+  defp reload_local_claude_deployment!(data_path, workspace_root, fake_claude, fun) do
+    workflow_path = Workflow.workflow_file_path()
+    write_local_claude_workflow!(workflow_path, data_path, workspace_root, fake_claude, max_concurrent_agents: 1)
+
+    restart_workflow_store!()
+    fun.()
+  end
+
+  # Reloads a real `tracker.kind: memory` + (default) Codex deployment (T034/SC-004's reference
+  # side -- `tasks.md` T034 names `tracker.kind: memory` as the deterministic stand-in for an
+  # existing hosted-tracker + Codex deployment) with the same normalized active/terminal states
+  # and concurrency limit as `reload_local_claude_deployment!/4`, and runs `fun` against it.
+  defp reload_memory_codex_deployment!(fun) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["todo", "in_progress"],
+      tracker_terminal_states: ["done", "cancelled"],
+      max_concurrent_agents: 1
+    )
+
+    restart_workflow_store!()
+    fun.()
+  end
+
+  # Drives the real, non-stubbed `Orchestrator.sort_issues_for_dispatch_for_test/1` and
+  # `Orchestrator.should_dispatch_issue_for_test/2` functions -- the same boundary
+  # `workspace_and_config_test.exs` already treats as the real scheduler surface -- against the
+  # given normalized issues under whichever deployment config is currently loaded.
+  defp collect_scheduler_observables(issues) do
+    sorted = Orchestrator.sort_issues_for_dispatch_for_test(issues)
+    candidate = hd(sorted)
+
+    free_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    occupied_state = %{
+      free_state
+      | running: %{"sc004-occupying-run" => %{issue: %Issue{id: "sc004-occupying-run", state: "todo"}}}
+    }
+
+    %{
+      dispatch_order: Enum.map(sorted, & &1.identifier),
+      eligible_with_free_slot?: Orchestrator.should_dispatch_issue_for_test(candidate, free_state),
+      eligible_with_slot_taken?: Orchestrator.should_dispatch_issue_for_test(candidate, occupied_state)
+    }
+  end
+
+  # Injects a synthetic normal worker exit directly against a real, freshly-started
+  # `Orchestrator` GenServer (mirroring core_test.exs's "normal worker exit schedules
+  # active-state continuation retry" reference case) and captures the resulting retry decision.
+  # `handle_agent_down/5` and its callees take no tracker/agent-execution-kind argument, so this
+  # exercises the real retry/backoff boundary under whichever deployment config is currently
+  # loaded.
+  defp capture_retry_decision!(orchestrator_name) do
+    issue_id = "sc004-retry-#{System.unique_integer([:positive])}"
+    ref = make_ref()
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "SC004-RETRY",
+      issue: %Issue{id: issue_id, identifier: "SC004-RETRY", state: "in_progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    GenServer.stop(pid)
+
+    %{attempt: state.retry_attempts[issue_id].attempt, due_at_ms: state.retry_attempts[issue_id].due_at_ms}
+  end
+
+  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
+    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+
+    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms <= max_remaining_ms
   end
 
   defp drain_lifecycle_events(issue_id), do: drain_lifecycle_events(issue_id, [])
