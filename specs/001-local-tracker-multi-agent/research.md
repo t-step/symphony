@@ -1168,3 +1168,94 @@ servers, but it can no longer override Symphony-owned MCP server identities, bec
 config is always supplied last. No other part of R8's Correction Addendum changes — `symphony_tracker`
 keeps its stable, non-randomized name; `--strict-mcp-config`, `--setting-sources project,local`, and the
 rest of the local execution trust model are unaffected.
+
+## T037 Addendum (2026-08-26): quickstart.md Scenarios 1–3 live acceptance run
+
+**Scope**: T037's acceptance criterion — execute `quickstart.md` Scenarios 1–3 front-to-back exactly as
+written, against real `codex`/`claude` CLIs, real Symphony processes, and real filesystem state, with no
+code changes made to satisfy any step. Run from a clean `development` checkout at `387cf6b` (T001–T036A
+complete). No product code or `quickstart.md`/`README.md` text was altered by this run.
+
+**Result: all three scenarios pass.** Detailed per-step evidence (setup, commands, observed outcome,
+pass/fail) is not reproduced here per the project's "no terminal transcripts in permanent docs" convention;
+this addendum records only what a future reader needs to trust the verdict and to avoid re-discovering the
+same environment friction.
+
+**Scenario 1 (local tracker only, SC-001)**: all 13 steps passed, including the fresh-init refusal
+(`local_tracker_not_initialized`), non-destructive re-init, seed → dispatch → Codex execution → lifecycle
+write, clean restart with state preserved, corruption detection (`local_tracker_corrupt`), marker-loss
+detection and repair (`local_tracker_ambiguous_state`/`:marker_missing`), established-state-loss while
+running (`:missing_after_established`, no crash), `--reset`, the `tracker.provider.path` restart-only
+pin, and concurrent same-tick lifecycle writes to two different issues (both landed, same timestamp, no
+lost update).
+
+**Scenario 2 (Claude Code execution only, SC-002/SC-003)**: all 8 steps passed, including a real Claude
+Code-backed run reaching the same class of operator-visible lifecycle events (`session started` →
+`Completed agent run` → terminal outcome) a Codex run reports; an unmodified parallel Codex deployment
+proven unaffected; launch-failure retry on a nonexistent `claude_code.command` executable using the exact
+same backoff schedule (10s/20s/40s) as an equivalent Codex launch failure; the MCP `local_tracker_set_state`
+tool call landing on the exact bound issue (confirmed by reading `.symphony/local_tracker.json` directly,
+issue reached `done`); two concurrent Claude-backed runs each mutating only their own bound issue with no
+cross-contamination; and `agent_execution.kind: claude_code` + non-empty `worker.ssh_hosts` refused at
+startup with the documented message, clearing again once `worker.ssh_hosts` is removed.
+
+**Scenario 3 (local tracker + Claude Code together, SC-004)**: a single local-tracker item completed its
+full lifecycle (`todo` → `in_progress` → `done`) using only those two components, workspace cleaned up on
+terminal state. The dispatch-order/concurrency-limit/retry-backoff equivalence claim was corroborated by
+direct observation — this run's backoff timings and concurrency-slot accounting were identical to Scenario
+1's and Scenario 2's — rather than by re-deriving a fresh statistical comparison; T034's automated
+`local_tracker_claude_code_composition_test.exs` remains the authoritative, repeatable SC-004 proof and
+was not re-run here (unchanged since the last passing `make all`).
+
+**Environment substitutions (setup, not scenario changes)**:
+- This machine's `claude`/`codex` on `$PATH` resolve through a `cmux`-installed CLI wrapper (session
+  hooks, injected `--settings`, auto-generated `--session-id` when absent) rather than the native binary.
+  All scratch `WORKFLOW.md` files pointed `codex.command`/`claude_code.command` at the native binaries
+  directly (`~/.local/bin/codex`, `~/.local/bin/claude`, both v2.1.246/0.146.0-class) to exercise the
+  documented CLI contract unmodified by that wrapper. Verified by inspecting the spawned process argv:
+  the wrapper's injected `--settings` JSON was absent from Symphony-launched `claude` processes.
+- The installed `codex` CLI (0.146.0) rejects `codex.approval_policy`'s documented default object-form
+  `{"reject": {...}}` (`unknown variant 'reject', expected one of untrusted, on-request, granular, never`
+  — an app-server schema mismatch versioned independently of this feature and outside its scope).
+  Scratch `WORKFLOW.md` files set `codex.approval_policy: never` (one of the CLI's own accepted values)
+  to unblock Codex-backed dispatch; this is orthogonal to `tracker.kind`/`agent_execution.kind`.
+- No hosted-tracker credential (Linear/GitHub/GitLab/Jira/Asana) was available in this environment.
+  Scenario 2 step 4's "existing Codex + hosted-tracker" parallel-deployment check used
+  `tracker.kind: memory` instead, per `tasks.md` T034's own accepted equivalence-testing convention
+  ("existing Codex + hosted-tracker (**or** `tracker.kind: memory`)"). `tracker.kind: memory` has no
+  `WORKFLOW.md`-level or CLI-level seeding mechanism — `SymphonyElixir.Tracker.Memory` only ever reads
+  `Application.get_env(:symphony_elixir, :memory_tracker_issues, [])`, set today exclusively from
+  `mix test` helpers — so seeding it for a live run used `mix run --no-start --no-halt` with a one-line
+  `Application.put_env/3` ahead of `SymphonyElixir.CLI.main/1`, per quickstart's own "per existing
+  Tracker.Memory test-fixture conventions" phrasing and README's already-documented `mix run --no-halt`
+  launch alternative to `bin/symphony`.
+- `tracker.kind: memory` issues also have no lifecycle-mutation tool at all (`Tracker.Memory` advertises
+  none), so an issue seeded there can never reach a genuine terminal *tracker* state — only Symphony's own
+  per-attempt "reached `agent.max_turns`" event is observable. This is a pre-existing, by-design property
+  of the memory adapter (its own `@moduledoc` scopes it to "tests and local development"), not a defect;
+  Scenario 2's terminal-outcome-class assertion was satisfied by that per-attempt event, and Scenario 2
+  step 6's genuine terminal-*tracker*-state assertion was independently satisfied by switching to
+  `tracker.kind: local` for that one step, as the step itself already directs.
+- Every `bin/symphony <workflow>` invocation (i.e. not `local-tracker init`) required the pre-existing
+  `--i-understand-that-this-will-be-running-without-the-usual-guardrails` acknowledgement flag
+  (`cli.ex`'s `require_guardrails_acknowledgement/1`). Neither `quickstart.md` nor `README.md`'s run
+  examples mention this flag; it predates this feature and is unconditional for every deployment
+  regardless of `tracker.kind`/`agent_execution.kind`, so it was supplied as environment-specific CLI
+  usage rather than treated as a feature-001 documentation defect in scope for this task.
+- Scenario 2 step 8's "worker.ssh_hosts alone with agent_execution.kind: codex still dispatches to the
+  remote host exactly as before" clause was verified only up to config validation passing (no rejection);
+  actually dispatching to a live SSH worker was not exercised — no SSH worker fixture/credential was
+  available in this environment, and standing one up is outside T037's scope. This path is unmodified by
+  feature 001 and already has its own coverage (`make e2e`'s SSH scenario).
+- Scenario 2 step 7's optional deeper cross-token HTTP check (manually requesting run A's port with run
+  B's token) was not repeated live — the behavioral proof (each item's record reflects only its own
+  mutation) was already captured, and the token-rejection mechanism itself is covered by
+  `claude_code_mcp_server_test.exs` (T021).
+
+**Product defects found**: none. **Quickstart/README defects found**: none rising to the "quickstart
+instruction is factually wrong" bar — every friction point above was either pre-existing/out-of-scope
+(the guardrails flag, the Codex approval-policy schema mismatch) or already implied by quickstart's own
+wording (the memory-tracker seeding mechanism is explicitly deferred to "test-fixture conventions"). No
+`quickstart.md`/`README.md` text was changed.
+
+No other planning artifact was changed by this addendum, per T037's scope.
