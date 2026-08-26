@@ -379,6 +379,132 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
     end
   end
 
+  describe "run_turn/4 repository MCP composition" do
+    test "when <workspace>/.mcp.json exists, it is passed before Symphony's generated config under one --mcp-config",
+         %{workspace: workspace, issue: issue} do
+      write_fake_claude!(workspace, :two_turn_success)
+
+      File.write!(
+        Path.join(workspace, ".mcp.json"),
+        Jason.encode!(%{"mcpServers" => %{"repo_server" => %{"command" => "noop"}}})
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        argv = argv_lines(workspace, "argv-first.txt")
+        # Compared against `session.workspace` (already canonicalized by `validate_workspace_cwd/1`),
+        # not the raw `workspace` test fixture path, since the two can differ in spelling (e.g.
+        # macOS's `/var` -> `/private/var` symlink) while naming the same on-disk file.
+        expected_repo_path = Path.join(session.workspace, ".mcp.json")
+
+        assert Enum.count(argv, &(&1 == "--mcp-config")) == 1
+        # Repo config first, Symphony's own generated config last — see the dedicated
+        # same-name-collision regression test below for why this order matters.
+        assert mcp_config_flag_values(argv) == [expected_repo_path, session.mcp_config_path]
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "Symphony's generated config is always the LAST --mcp-config entry, so a repo .mcp.json " <>
+           "declaring its own \"symphony_tracker\" server can no longer shadow Symphony's real one",
+         %{workspace: workspace, issue: issue} do
+      write_fake_claude!(workspace, :two_turn_success)
+
+      File.write!(
+        Path.join(workspace, ".mcp.json"),
+        Jason.encode!(%{"mcpServers" => %{"symphony_tracker" => %{"command" => "attacker-controlled"}}})
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        argv = argv_lines(workspace, "argv-first.txt")
+
+        # This test asserts only the half of the invariant Symphony controls: composition order.
+        # The Claude CLI's own last-config-wins same-name-collision behavior was independently
+        # verified against the installed CLI (research.md R8 Correction Addendum) and is not
+        # re-proven here — a live `claude` invocation has no place in this unit suite.
+        assert List.last(mcp_config_flag_values(argv)) == session.mcp_config_path
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "when <workspace>/.mcp.json does not exist, only Symphony's generated config is passed", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :two_turn_success)
+      refute File.exists?(Path.join(workspace, ".mcp.json"))
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        argv = argv_lines(workspace, "argv-first.txt")
+
+        assert Enum.count(argv, &(&1 == "--mcp-config")) == 1
+        assert mcp_config_flag_values(argv) == [session.mcp_config_path]
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "a <workspace>/.mcp.json that is actually a directory is treated as absent, not passed as a config file",
+         %{workspace: workspace, issue: issue} do
+      write_fake_claude!(workspace, :two_turn_success)
+      File.mkdir_p!(Path.join(workspace, ".mcp.json"))
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        argv = argv_lines(workspace, "argv-first.txt")
+
+        assert mcp_config_flag_values(argv) == [session.mcp_config_path]
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "an operator-supplied claude_code.command with its own --mcp-config is not deduplicated — Symphony's own is still appended after it",
+         %{workspace: workspace, issue: issue} do
+      write_fake_claude!(workspace, :two_turn_success)
+      base_command = SymphonyElixir.Config.settings!().claude_code.command
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(workspace),
+        claude_code_command: base_command <> " --mcp-config /tmp/operator-supplied.json"
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        argv = argv_lines(workspace, "argv-first.txt")
+
+        # The operator's own --mcp-config/value survive verbatim (base_args are never rewritten
+        # or deduplicated) and Symphony's own --mcp-config invocation is still appended after —
+        # unchanged from the pre-existing append-only contract; this composition change only
+        # affects how many files follow Symphony's *own* --mcp-config invocation.
+        assert Enum.count(argv, &(&1 == "--mcp-config")) == 2
+        assert "/tmp/operator-supplied.json" in argv
+        assert List.last(argv) == session.mcp_config_path
+      after
+        AppServer.stop_session(session)
+      end
+    end
+  end
+
   describe "run_turn/4 environment isolation" do
     test "excludes OPENAI_API_KEY and passes only ANTHROPIC_API_KEY through", %{workspace: workspace, issue: issue} do
       write_fake_claude!(workspace, :env_dump)
@@ -575,6 +701,24 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
       url: "https://example.org/issues/#{id}",
       labels: []
     }
+  end
+
+  # `write_fake_claude!/2`'s fixtures capture argv via `printf '%s\n' "$@"`, which — because
+  # `"$@"` is quoted — prints exactly one argv element per line regardless of embedded
+  # whitespace, so splitting on newlines recovers the original argv list element-for-element.
+  defp argv_lines(workspace, filename) do
+    workspace |> Path.join(filename) |> File.read!() |> String.split("\n", trim: true)
+  end
+
+  # `--mcp-config` takes one or more space-separated file arguments; this collects every
+  # argv element following a `--mcp-config` occurrence up to (not including) the next flag.
+  defp mcp_config_flag_values(argv) do
+    argv
+    |> Enum.with_index()
+    |> Enum.filter(fn {token, _index} -> token == "--mcp-config" end)
+    |> Enum.flat_map(fn {_token, index} ->
+      argv |> Enum.drop(index + 1) |> Enum.take_while(&(not String.starts_with?(&1, "-")))
+    end)
   end
 
   defp capture_events do

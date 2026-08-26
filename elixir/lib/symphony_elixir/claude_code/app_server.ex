@@ -26,6 +26,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
           workspace: Path.t(),
           mcp_server: MCPServer.start_result(),
           mcp_config_path: Path.t(),
+          repo_mcp_config_path: Path.t() | nil,
           turn_state: :atomics.atomics_ref()
         }
 
@@ -45,7 +46,13 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
   @spec run_turn(session(), String.t(), Issue.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
-        %{session_id: session_id, workspace: workspace, mcp_config_path: mcp_config_path, turn_state: turn_state},
+        %{
+          session_id: session_id,
+          workspace: workspace,
+          mcp_config_path: mcp_config_path,
+          repo_mcp_config_path: repo_mcp_config_path,
+          turn_state: turn_state
+        },
         prompt,
         %Issue{} = issue,
         opts \\ []
@@ -59,7 +66,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     # believing a Claude session was established when the CLI never saw `--session-id` at all.
     claimed_first_turn? = :atomics.exchange(turn_state, 1, 1) == 0
 
-    case start_port(workspace, prompt, session_id, claimed_first_turn?, mcp_config_path) do
+    case start_port(workspace, prompt, session_id, claimed_first_turn?, mcp_config_path, repo_mcp_config_path) do
       {:ok, port} ->
         Logger.info("Claude Code turn started for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -147,6 +154,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
              workspace: workspace,
              mcp_server: mcp_server,
              mcp_config_path: mcp_config_path,
+             repo_mcp_config_path: repo_mcp_config_path(workspace),
              turn_state: :atomics.new(1, [])
            }}
 
@@ -155,6 +163,25 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
           {:error, reason}
       end
     end
+  end
+
+  # Composes the workspace's own `.mcp.json` (when present) alongside Symphony's generated
+  # per-run MCP config under one `--strict-mcp-config`-scoped `--mcp-config` invocation, instead
+  # of `--strict-mcp-config` excluding it outright — repo-owned MCP is explicitly admitted, never
+  # ambient/user-global MCP (research.md R8 Correction Addendum, 2026-08-26; contracts/
+  # workflow-config-fields.md). Computed once here, not re-checked per turn, so a run's MCP
+  # composition can't change mid-run even if the file is added/removed on disk later. `workspace`
+  # is the per-issue workspace path (never the source repo itself per contracts/
+  # coding-agent-behaviour.md), so this assumes the workspace is a checkout of the target
+  # repository and therefore carries the repository's own `.mcp.json`, if any, at its root.
+  # `File.regular?/1` (not `File.exists?/1`) so a `.mcp.json` that is actually a directory is
+  # treated as absent rather than passed to `claude` as a config file. `File.regular?/1` follows
+  # symlinks by design here (not `File.lstat/1`): a symlinked `.mcp.json` is accepted like any
+  # other file under the existing trusted-repository execution model (the repo already executes
+  # arbitrary code via the coding agent) — no extra restriction is added for the symlink case.
+  defp repo_mcp_config_path(workspace) do
+    path = Path.join(workspace, ".mcp.json")
+    if File.regular?(path), do: path
   end
 
   defp write_mcp_config(%{port: port, token: token}, opts) do
@@ -177,7 +204,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
-  defp start_port(workspace, prompt, session_id, first_turn?, mcp_config_path) do
+  defp start_port(workspace, prompt, session_id, first_turn?, mcp_config_path, repo_mcp_config_path) do
     with {:ok, [executable | base_args]} <- resolve_command() do
       session_args = if first_turn?, do: ["--session-id", session_id], else: ["--resume", session_id]
 
@@ -190,9 +217,8 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
             "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--mcp-config",
-            mcp_config_path
-          ]
+            "--mcp-config"
+          ] ++ mcp_config_args(mcp_config_path, repo_mcp_config_path)
 
       port =
         Port.open(
@@ -210,6 +236,20 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
       {:ok, port}
     end
   end
+
+  # The workspace's own `.mcp.json` (when present, per `repo_mcp_config_path/1`) is placed
+  # BEFORE Symphony's own generated config in this single `--mcp-config` invocation — the CLI
+  # documents `--mcp-config` as accepting multiple space-separated files in one invocation
+  # (confirmed against the installed CLI), and empirically, when two `--mcp-config` inputs define
+  # an MCP server under the same name, the LATER one wins (confirmed against the installed CLI).
+  # Symphony's own config is therefore ordered last so it is authoritative on any name collision:
+  # a repo-controlled `.mcp.json` can contribute additional MCP servers, but it cannot shadow or
+  # override Symphony's own `symphony_tracker` server identity by declaring a same-named server.
+  # This composes repo-owned MCP with Symphony's own without touching `--strict-mcp-config` (still
+  # present in `claude_code.command`'s default), which continues to exclude every other,
+  # ambient/user-global MCP source — only these explicitly-named files are ever admitted.
+  defp mcp_config_args(mcp_config_path, nil), do: [mcp_config_path]
+  defp mcp_config_args(mcp_config_path, repo_mcp_config_path), do: [repo_mcp_config_path, mcp_config_path]
 
   # `claude_code.command` is deliberately parsed as a plain whitespace-separated argv list
   # (`String.split/1`, no quote/operator awareness) and spawned directly via

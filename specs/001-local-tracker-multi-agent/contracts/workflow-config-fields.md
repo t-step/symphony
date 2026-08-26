@@ -19,8 +19,9 @@ and for the `Config.Schema` implementation.
   event-type names) is re-verified against the targeted Claude Code CLI version, mirroring how `SPEC.md`
   §10 already treats "the targeted Codex app-server version" (not this spec) as the protocol source of
   truth. At minimum, mirrors `codex.command` with a `claude_code.command` default (the `claude` CLI
-  invocation, launched with `--bare --permission-mode bypassPermissions --strict-mcp-config` per
-  research.md R5/R8 — confirmed flags, not placeholders) and a `claude_code.turn_timeout_ms`/
+  invocation, launched with `--setting-sources project,local --permission-mode bypassPermissions
+  --strict-mcp-config` per research.md's R8 Correction Addendum, 2026-08-26 — confirmed flags, not
+  placeholders; see "Local execution trust model" below) and a `claude_code.turn_timeout_ms`/
   `read_timeout_ms` pair analogous to `codex.turn_timeout_ms`/`codex.read_timeout_ms`.
 
   **`command` parsing model — an intentional divergence from `codex.command`, decided during the
@@ -42,6 +43,54 @@ and for the `Config.Schema` implementation.
   `claude_code_app_server_test.exs`'s "claude_code.command parsing contract" tests, which pin down both
   the supported case (appending additional whitespace-separated flags) and the explicitly-unsupported
   case (shell-style quoting) as regression tests.
+
+## Local execution trust model and MCP composition (research.md R8 Correction Addendum, 2026-08-26)
+
+`claude_code.command`'s default deliberately authenticates via the operator's existing Claude
+subscription/OAuth login rather than requiring a separate `ANTHROPIC_API_KEY`, while still excluding
+ambient, user-global Claude Code configuration:
+
+- **Allowed**: the operator's existing Claude subscription/OAuth identity; the repository's own
+  `CLAUDE.md`/`.claude/settings.json` (hooks, permissions, plugin config) and `.claude/settings.local.json`
+  (personal-but-per-repo overrides) via `--setting-sources project,local`; the repository's own
+  `.mcp.json`, when present at the workspace root, composed explicitly alongside Symphony's generated
+  per-run MCP config under one `--mcp-config` invocation (`ClaudeCode.AppServer.mcp_config_args/2`);
+  `--strict-mcp-config` continues to exclude every MCP source other than these two explicitly-named files.
+  **Ordering matters for same-name collisions**: repo config is placed first, Symphony's own generated
+  config last, because the CLI resolves a same-name MCP server across multiple `--mcp-config` inputs by
+  last-one-wins (independently verified against the installed CLI). A repository-controlled `.mcp.json`
+  may therefore contribute additional MCP servers, but it cannot override or shadow Symphony's own
+  `symphony_tracker` server identity by declaring a same-named server — Symphony's config is always
+  supplied last and is authoritative on collision.
+- **Denied**: `~/.claude/settings.json` (user-global hooks/plugins/permissions), `~/.claude/CLAUDE.md`
+  (user-global instructions), and any user- or local-scope MCP server not named in `--mcp-config` — all
+  excluded by `--setting-sources project,local` omitting `user`, independent of `--strict-mcp-config`.
+  `OPENAI_API_KEY`/Codex's own credentials and every other unrelated environment variable remain excluded
+  by `claude_subprocess_env/0`'s allow-list, unchanged by this correction.
+- **Trust boundary, stated explicitly**: headless (`-p`) mode never shows Claude Code's interactive
+  workspace-trust dialog, so a repository's own hooks and `.mcp.json` servers execute/connect
+  unconditionally the first time Symphony dispatches a `claude_code` turn against that workspace — there
+  is no per-run approval step. This relies on Symphony's own existing trust boundary (it already executes
+  arbitrary repository code via the coding agent by design); it is not a new risk this feature introduces,
+  but it is a materially different exposure than `--bare`'s total silence on repository content, and is
+  documented here so it is never mistaken for an oversight.
+- **Not supported in headless mode regardless of this configuration**: repository-checked-in *subagents*
+  and `@skills-dir` plugins do not load in `claude -p` mode even with the folder trusted or with
+  `--setting-sources project,local` — this is a Claude Code CLI limitation (unrelated to
+  `--strict-mcp-config` or `--setting-sources`), not something this feature attempts to work around.
+- **`.mcp.json` composition assumption**: `ClaudeCode.AppServer` looks for `.mcp.json` at the *workspace*
+  root, not the source repository — this is correct only because a per-issue workspace is itself a
+  checkout of the target repository (per contracts/coding-agent-behaviour.md's `start_session/2` note that
+  `workspace` is "never the source repo" but is the per-issue working copy), so a repository-committed
+  `.mcp.json` is present there too.
+- **`claude_code.command` overrides remain fully supported**: an operator may still set `claude_code.command`
+  to include `--bare` (or any other flag combination) for the strictest, config-blind, API-key-only
+  isolation instead of the new default — this correction changes the schema *default*, not the supported
+  flag surface. A custom `claude_code.command` that itself contains a `--mcp-config <file>` is not
+  deduplicated against Symphony's own — Symphony's own `--mcp-config [<repo>,] <generated>` invocation is
+  still appended after the operator's base command, unchanged from the pre-existing append-only contract
+  (`ClaudeCode.AppServer.start_port/6`); the generated file is always the last argument to that invocation
+  (see the ordering note above).
 
 ## Structural vs. dynamic reload (IV-005)
 

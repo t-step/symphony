@@ -254,7 +254,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:command, :string, default: "claude --bare --permission-mode bypassPermissions --strict-mcp-config")
+      field(:command, :string, default: "claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config")
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
     end

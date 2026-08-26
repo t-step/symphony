@@ -8,6 +8,18 @@ defmodule SymphonyElixir.ConfigClaudeCodeWorkerHostValidationTest do
     assert Config.settings!().agent_execution.kind == "codex"
   end
 
+  test "omitted claude_code.command resolves to the scoped local-execution default, not --bare" do
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    assert :ok = Config.validate!()
+    command = Config.settings!().claude_code.command
+
+    assert command ==
+             "claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config"
+
+    refute command =~ "--bare"
+  end
+
   test "worker.ssh_hosts alone with agent_execution.kind: codex (default) is unaffected" do
     write_workflow_file!(Workflow.workflow_file_path(), worker_ssh_hosts: ["build-host"])
 
@@ -30,7 +42,7 @@ defmodule SymphonyElixir.ConfigClaudeCodeWorkerHostValidationTest do
   test "valid Claude Code configuration without SSH hosts is accepted" do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_execution_kind: "claude_code",
-      claude_code_command: "claude --bare --permission-mode bypassPermissions --strict-mcp-config",
+      claude_code_command: "claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config",
       claude_code_turn_timeout_ms: 1_800_000,
       claude_code_read_timeout_ms: 2_500
     )
@@ -40,7 +52,10 @@ defmodule SymphonyElixir.ConfigClaudeCodeWorkerHostValidationTest do
     settings = Config.settings!()
     assert settings.agent_execution.kind == "claude_code"
     assert settings.worker.ssh_hosts == []
-    assert settings.claude_code.command == "claude --bare --permission-mode bypassPermissions --strict-mcp-config"
+
+    assert settings.claude_code.command ==
+             "claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config"
+
     assert settings.claude_code.turn_timeout_ms == 1_800_000
     assert settings.claude_code.read_timeout_ms == 2_500
   end

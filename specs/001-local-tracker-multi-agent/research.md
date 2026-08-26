@@ -1053,3 +1053,118 @@ provider-aware branching in any caller. The contract doc now says so explicitly.
   around it was out of scope.
 
 No T027 (or later) production code was touched by this repair.
+
+## R8 Correction Addendum (2026-08-26): scoped local execution model supersedes `--bare` as the default
+
+**Scope**: two investigation-only sessions (not implementation sessions) re-examined R8's default
+auth/isolation choice against primary evidence — the installed CLI's own `--help`/`--setting-sources`
+semantics, `code.claude.com` documentation, and live, non-destructive experiments against the real,
+native `claude` binary (not this development sandbox's `cmux`-shimmed `claude` on `PATH`, which proxies
+back into the live session and is not production-representative). This addendum corrects R8's **default
+command choice only** — R8's other findings (`--permission-mode bypassPermissions`'s correctness, the
+`OPENAI_API_KEY`/Codex-credential-exclusion pattern, `--strict-mcp-config`'s role) remain correct and
+unchanged. This is a correction, not a claim that T022/T023 knew this at the time; the production repair
+this addendum authorizes is tracked as its own task, T028A (tasks.md), not folded into T022/T023's
+history.
+
+**1. `--bare` forces API-key-only auth and cannot be relaxed in place (confirmed, not new).** Verbatim
+from the installed CLI's own `--help`: `--bare` — "Anthropic auth is strictly `ANTHROPIC_API_KEY` or
+`apiKeyHelper` via `--settings` (OAuth and keychain are never read)." This is exactly what R8 already
+documented; it is restated here only because it is the reason T029 (tasks.md) has been blocked on
+`ANTHROPIC_API_KEY` availability rather than able to use an already-authenticated Claude subscription.
+
+**2. `--safe-mode` is not the fix — it is scope-blind, not scope-aware.** The first investigation session
+initially proposed `--safe-mode` (which does not force API-key auth: "Authentication, model selection,
+built-in tools, and permissions work normally... which differs from `--bare`") as a way to unblock
+subscription/OAuth auth. Confirmed via the CLI's own full flag description that this was the wrong
+mechanism for what Symphony's local execution model actually wants: `--safe-mode` "Start[s] with all
+customizations disabled... CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands and agents,
+output styles, workflows, custom themes, custom keybindings, status line and file-suggestion commands, LSP
+servers, and auto memory do not load" — an all-or-nothing kill switch with no repo-vs-user distinction.
+Empirically confirmed this also disables the workspace's own `.mcp.json` and any project-scoped hooks, not
+just ambient/user-global ones — exactly the repository-owned context Symphony's local execution model
+wants to *keep*.
+
+**3. `--setting-sources <user,project,local>` is the actual scope-aware mechanism.** This flag controls
+which settings-file scope(s) load: `~/.claude/settings.json` (`user`), `.claude/settings.json`
+(`project`, the file a repository commits and shares with its team), and `.claude/settings.local.json`
+(`local`, personal-but-per-repo, gitignored). Per `code.claude.com/docs/en/mcp`: excluding `project` from
+`--setting-sources` is the documented way to keep a project's own `.mcp.json` from loading at all — the
+same mechanism generalizes, in the opposite direction, to excluding `user` while keeping `project`/`local`.
+Per `code.claude.com/docs/en/permissions`' "What runs before you trust a folder" table: in `claude -p`
+(headless — Symphony's exact invocation mode) with the folder never trusted (headless mode never shows the
+interactive trust dialog at all), **project-scoped hooks are "Used" unconditionally** and **project
+`.mcp.json` servers are "Connected without asking, approved or not."** Repository-owned hooks and MCP
+already work headlessly today with zero special flags; the piece that needed active suppression was
+user-global config, not repository config — `--setting-sources` is exactly that suppression knob, and it
+does not touch `--strict-mcp-config`, the environment allow-list, or `--permission-mode`.
+
+**4. Empirically verified end to end**, against the real native `claude` binary, with Symphony's exact
+`claude_subprocess_env/0` allow-list (`PATH HOME USER SHELL LANG LC_ALL LC_CTYPE TERM TMPDIR
+ANTHROPIC_API_KEY`), with `ANTHROPIC_API_KEY` unset, using normal auth mode (no `--bare`, no
+`--safe-mode`) plus `--setting-sources project,local --strict-mcp-config --mcp-config <two explicit
+files>`, in one combined run:
+   - A scratch repo's own `CLAUDE.md` loaded (the model echoed a planted marker phrase) while the real
+     ambient `~/.claude/CLAUDE.md` did not leak (a targeted recall probe, not `system/init` metadata,
+     answered NO).
+   - A scratch repo-scoped `SessionStart` hook fired (a marker file was created on disk) while a real
+     ambient plugin hook (observed firing under plain normal-mode with no `--setting-sources` in an
+     earlier probe in the same investigation) did not fire (empty stderr).
+   - `system/init`'s `mcp_servers` field listed both a repo-scoped probe server (from the scratch repo's
+     own `.mcp.json`) and a Symphony-style explicit server (from a second, separately-named
+     `--mcp-config` file) as attempted, while a real ambient user-scope MCP server already configured on
+     the test machine never appeared.
+   - Installed marketplace plugin enumeration dropped from the real set of installed plugins (visible
+     under both plain normal-mode and `--safe-mode`) to empty.
+   - `apiKeySource` stayed `"none"` throughout, and a real `--session-id` then `--resume` pair correctly
+     preserved conversation context (a planted word was recalled) — proving this composes with Symphony's
+     real per-turn relaunch pattern (research.md R7), non-interactively, with no TTY.
+
+**5. MCP composition: `--strict-mcp-config` is not weakened.** `--strict-mcp-config`'s own documented
+behavior ("Only use MCP servers from `--mcp-config`, ignoring all other MCP configurations") does not
+carve out project `.mcp.json` — dropping it to admit repo MCP was never necessary or considered. Instead,
+`--mcp-config` itself accepts multiple space-separated files in one invocation (confirmed against the
+installed CLI in the same experiment above): Symphony's own generated per-run MCP config and the
+workspace's own `.mcp.json` (when present) are both passed to the *same* `--mcp-config` invocation, so
+`--strict-mcp-config` continues to exclude every other (ambient/user-global) MCP source untouched.
+
+**Decision (supersedes R8's default only)**: `claude_code.command`'s schema default changes from
+`claude --bare --permission-mode bypassPermissions --strict-mcp-config` to
+`claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config`.
+`ClaudeCode.AppServer` additionally composes the workspace's own `.mcp.json` (when present at the
+workspace root — the per-issue workspace is a checkout of the target repository, never the source repo
+itself, per contracts/coding-agent-behaviour.md) into the same `--mcp-config` invocation as Symphony's own
+generated config. `--bare` remains fully available as an explicit operator override in `claude_code.command`
+for deployments that want the strictest, config-blind, API-key-only isolation instead — this addendum
+changes the *default*, not the CLI's supported flag surface. Tracked as tasks.md T028A, inserted before
+T029 (which T029 now depends on) — see contracts/workflow-config-fields.md for the corresponding contract
+update.
+
+**Trust-boundary implication, stated explicitly (not previously written down anywhere in this feature's
+planning artifacts)**: because headless mode never shows a trust dialog, any hook or `.mcp.json` server
+committed to a repository's `.claude/settings.json`/`.mcp.json` executes/connects unconditionally the
+first time Symphony dispatches a `claude_code` turn against that workspace — there is no approval step to
+opt out of. This is consistent with Symphony's own existing trust boundary (it already executes arbitrary
+repository code via the coding agent, by design) but is a materially different exposure than `--bare`'s
+total silence on repository content, and is why this addendum documents it explicitly rather than treating
+it as an implementation detail.
+
+**What this addendum does not change**: the `OPENAI_API_KEY`/Codex-credential exclusion pattern
+(`claude_subprocess_env/0`'s allow-list, untouched), `--permission-mode bypassPermissions`,
+`--strict-mcp-config` itself, the direct-executable/no-shell/whitespace-argv `claude_code.command` parsing
+model (Repair Addendum above, unchanged), and repository subagents/`@skills-dir` plugins remain
+**not** loaded in headless mode regardless of trust (per the same "What runs before you trust a folder"
+table) — this addendum does not claim otherwise and no work in T028A attempts to change that.
+
+**Review correction (2026-08-26): `--mcp-config` composition order.** An independent review of T028A found
+that `mcp_config_args/2` originally ordered Symphony's own generated config *before* the repo's `.mcp.json`
+in the single `--mcp-config` invocation. Empirically verified against the installed CLI: when two
+`--mcp-config` inputs define an MCP server under the same name, the *later* one wins. Under the original
+order, a repository-controlled `.mcp.json` declaring its own server named `symphony_tracker` would
+therefore silently shadow Symphony's real tracker server — a collision resolved entirely inside the CLI's
+own config merge, invisible to Symphony's per-run bearer-token check. Fixed by reordering
+`mcp_config_args/2` to `[repo, generated]`: repository MCP configuration may contribute additional MCP
+servers, but it can no longer override Symphony-owned MCP server identities, because Symphony's generated
+config is always supplied last. No other part of R8's Correction Addendum changes — `symphony_tracker`
+keeps its stable, non-randomized name; `--strict-mcp-config`, `--setting-sources project,local`, and the
+rest of the local execution trust model are unaffected.
