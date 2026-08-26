@@ -73,4 +73,6 @@ If behavior/config changes, update docs in the same PR:
 
 - `../README.md` for project concept and goals.
 - `README.md` for Elixir implementation and run instructions.
-- `WORKFLOW.md` for workflow/config contract changes.
+- `WORKFLOW.md` for workflow/config contract changes, which now includes the local tracker
+  (`tracker.kind: local`, `symphony local-tracker init`) and Claude Code execution
+  (`agent_execution.kind`, `claude_code.*`) surface.
