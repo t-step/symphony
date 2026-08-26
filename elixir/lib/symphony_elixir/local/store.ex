@@ -193,13 +193,24 @@ defmodule SymphonyElixir.Local.Store do
   defp decode_store(content) do
     case Jason.decode(content) do
       {:ok, %{"format_version" => 1, "issues" => issues}} when is_map(issues) ->
-        {:ok, %{format_version: 1, issues: issues}}
+        validate_issue_records(issues)
 
       {:ok, decoded} ->
         {:error, {:invalid_shape, decoded}}
 
       {:error, %Jason.DecodeError{} = error} ->
         {:error, {:invalid_json, Exception.message(error)}}
+    end
+  end
+
+  # Enforces the invariant every caller of `decode_store/1` relies on: once this returns `{:ok,
+  # _}`, every value in `issues` is a map. A non-map record (e.g. a hand-edited data file with
+  # `"ISSUE-1": "todo"` instead of an object) is treated as the same class of on-disk corruption as
+  # an unparseable data file — never surfaced to `Local.Adapter`/the orchestrator as usable data.
+  defp validate_issue_records(issues) do
+    case Enum.find(issues, fn {_id, record} -> not is_map(record) end) do
+      nil -> {:ok, %{format_version: 1, issues: issues}}
+      {id, record} -> {:error, {:invalid_shape, {:non_map_issue_record, id, record}}}
     end
   end
 

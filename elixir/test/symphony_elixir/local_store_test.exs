@@ -86,6 +86,22 @@ defmodule SymphonyElixir.LocalStoreTest do
       assert {:error, {:local_tracker_corrupt, {:invalid_shape, _decoded}}} = Store.read(store)
     end
 
+    test "marker present with a non-map issue record is corrupt, not silently accepted", %{
+      data_path: data_path,
+      marker_path: marker_path
+    } do
+      write_marker!(marker_path)
+      write_data!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => "todo", "2" => %{"state" => "done"}}}))
+      store = start_store!(data_path)
+
+      original = File.read!(data_path)
+
+      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
+               Store.read(store)
+
+      assert File.read!(data_path) == original
+    end
+
     test "marker present but unreadable (a directory, not a file) is treated as established-state loss", %{data_path: data_path, marker_path: marker_path} do
       write_valid_data!(data_path)
       File.mkdir_p!(marker_path)
@@ -204,6 +220,22 @@ defmodule SymphonyElixir.LocalStoreTest do
       assert {:ok, _} = Task.await(task2)
 
       assert {:ok, %{issues: %{"1" => %{"state" => "in_progress"}, "2" => %{"state" => "blocked"}}}} = Store.read(store)
+    end
+
+    test "on a store containing a non-map issue record, returns the corruption error and writes nothing", %{
+      data_path: data_path,
+      marker_path: marker_path
+    } do
+      write_data!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => "todo", "2" => %{"state" => "todo"}}}))
+      write_marker!(marker_path)
+      store = start_store!(data_path)
+
+      before = File.read!(data_path)
+
+      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
+               Store.set_issue_state(store, "2", "in_progress")
+
+      assert File.read!(data_path) == before
     end
 
     test "a write failure (unwritable directory) leaves the existing file untouched", %{dir: dir, data_path: data_path, marker_path: marker_path} do

@@ -1248,6 +1248,37 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert %{"1" => ^running_entry} = state_after.running
     end
 
+    test "a non-map issue record after startup is skipped and retried the same way, without crashing the orchestrator or the running attempt (#0003)",
+         %{data_path: data_path} do
+      orchestrator_name = Module.concat(__MODULE__, :LocalNonMapRecordOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+      running_entry = running_entry_for(%Issue{id: "1", identifier: "LOC-1", state: "todo"})
+
+      :sys.replace_state(pid, fn state ->
+        state
+        |> Map.put(:running, %{"1" => running_entry})
+        |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
+      end)
+
+      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => "todo"}}))
+
+      log =
+        capture_log([level: :debug], fn ->
+          send(pid, :run_poll_cycle)
+          Process.sleep(50)
+        end)
+
+      assert log =~ "local_tracker_corrupt" or log =~ "Failed to refresh running issue states"
+
+      assert Process.alive?(pid)
+      state_after = :sys.get_state(pid)
+      assert %{"1" => ^running_entry} = state_after.running
+      refute Map.has_key?(state_after.retry_attempts, "1")
+      refute MapSet.member?(state_after.completed, "1")
+    end
+
     test "a transient, self-resolving read failure is tolerated the same way and recovers on the next tick", %{
       data_path: data_path
     } do

@@ -146,6 +146,18 @@ defmodule SymphonyElixir.Local.AdapterTest do
       assert {:ok, [%{id: "2"}]} = LocalAdapter.fetch_issues_by_states(["todo"])
       refute Enum.any?(elem(LocalAdapter.fetch_issues_by_states(["todo"]), 1), &(&1.id == "1"))
     end
+
+    test "a non-map issue record surfaces as a structured tracker error instead of raising", %{data_path: data_path} do
+      assert {:ok, :initialized} = Init.run(data_path)
+      seed_issues(data_path, %{"1" => "todo", "2" => %{"state" => "todo"}})
+      start_singleton!(data_path)
+
+      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
+               LocalAdapter.fetch_issues_by_states(["todo"])
+
+      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
+               LocalAdapter.fetch_issues_by_ids(["2"])
+    end
   end
 
   describe "local_tracker_set_state (session-scoped mutation)" do
