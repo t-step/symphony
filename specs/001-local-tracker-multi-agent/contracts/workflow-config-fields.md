@@ -23,6 +23,26 @@ and for the `Config.Schema` implementation.
   research.md R5/R8 — confirmed flags, not placeholders) and a `claude_code.turn_timeout_ms`/
   `read_timeout_ms` pair analogous to `codex.turn_timeout_ms`/`codex.read_timeout_ms`.
 
+  **`command` parsing model — an intentional divergence from `codex.command`, decided during the
+  T022/T023 adversarial-review repair (2026-08-25).** `claude_code.command` and `codex.command` are the
+  "same shape class" only in schema (both a single string field with the same validation), **not** in how
+  that string is interpreted at launch time:
+  - `codex.command` is interpolated into a `bash -lc "... && exec <command>"` script — a genuine shell
+    command line, supporting shell quoting, `env VAR=x <command>` wrapper prefixes, and other shell
+    operators, exactly as `bash -lc` would for any script.
+  - `claude_code.command` is tokenized as a **plain whitespace-separated argv list**
+    (`String.split/1`, no quote/operator awareness whatsoever) and spawned directly via
+    `:spawn_executable` — never through a shell. A value needing an embedded space inside a single
+    argument (e.g. a quoted flag value) is **not** supported and will not tokenize as a shell would: the
+    quote characters end up as literal characters split across two argv entries instead of one argument.
+  This is a deliberate, retained decision (not a defect to fix): direct-exec spawning removes any
+  shell-injection surface from this launch path entirely, which the review judged worth keeping over
+  mirroring `codex.command`'s shell semantics for symmetry's sake. See
+  `SymphonyElixir.ClaudeCode.AppServer.resolve_command/0`'s doc comment and
+  `claude_code_app_server_test.exs`'s "claude_code.command parsing contract" tests, which pin down both
+  the supported case (appending additional whitespace-separated flags) and the explicitly-unsupported
+  case (shell-style quoting) as regression tests.
+
 ## Structural vs. dynamic reload (IV-005)
 
 `tracker.kind` and `agent_execution.kind` are **structural** — read once at process start, changes take

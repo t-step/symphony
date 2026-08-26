@@ -47,6 +47,18 @@ contract below matches what the code has always actually done.
   in the frozen spec requires Claude Code to support it (confirmed: `worker_host`/SSH is not mentioned in
   `spec.md` or upstream `SPEC.md` as a requirement; the spec's own Assumptions permit Claude Code not
   exposing every Codex-specific capability).
+
+  `opts` may also carry `issue: Tracker.Issue.t()`, a **Claude-Code-specific required extension key**, not
+  part of the shared minimum every implementation must accept: `ClaudeCode.AppServer.start_session/2`
+  returns `{:error, :issue_required}` if it is absent, because the current work item must be bound to the
+  per-run `ClaudeCode.MCPServer` (R6a) at listener-start time, before any turn runs — unlike Codex, which
+  only needs the issue at `run_turn/4` time (its own `issue` positional parameter, unchanged). Passing
+  `issue:` to `Codex.AppServer.start_session/2` is harmless and required to remain so: Codex's
+  implementation only reads `opts[:worker_host]` and ignores unrecognized keys, so a caller (`AgentRunner`)
+  MAY pass `issue: issue` unconditionally regardless of which concrete `CodingAgent` module is active,
+  without introducing provider-aware branching into the caller. This preserves substitutability: the two
+  implementations differ in which opts keys they *require*, not in whether passing an extra key breaks the
+  other.
 - **Output**: `{:ok, session}` where `session` is an **opaque** term to the caller, fixed for the life of
   the run (see the session-identity note above the callback list). `AgentRunner` MUST NOT pattern-match
   on session internals or assume a subprocess is alive after this call returns — Codex's session is a

@@ -1,8 +1,9 @@
 defmodule SymphonyElixir.ClaudeCode.AppServerTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.ClaudeCode.AppServer
+  alias SymphonyElixir.ClaudeCode.{AppServer, MCPServer}
   alias SymphonyElixir.Local.{Adapter, Init}
+  alias SymphonyElixir.Tracker
 
   setup do
     test_root =
@@ -29,6 +30,85 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
   describe "start_session/2 issue requirement" do
     test "fails without raising when no issue is given", %{workspace: workspace} do
       assert {:error, :issue_required} = AppServer.start_session(workspace, [])
+    end
+  end
+
+  describe "start_session/2 workspace boundary validation" do
+    test "rejects the workspace root itself", %{test_root: test_root, issue: issue} do
+      workspace_root = Path.join(test_root, "wb-root-workspaces")
+      File.mkdir_p!(workspace_root)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:invalid_workspace_cwd, :workspace_root, _path}} =
+               AppServer.start_session(workspace_root, issue: issue)
+    end
+
+    test "rejects a path outside the configured workspace root", %{test_root: test_root, issue: issue} do
+      workspace_root = Path.join(test_root, "wb-outside-workspaces")
+      outside_workspace = Path.join(test_root, "wb-outside")
+      File.mkdir_p!(workspace_root)
+      File.mkdir_p!(outside_workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:invalid_workspace_cwd, :outside_workspace_root, _path, _root}} =
+               AppServer.start_session(outside_workspace, issue: issue)
+    end
+
+    test "rejects a symlink escape out of the configured workspace root", %{test_root: test_root, issue: issue} do
+      workspace_root = Path.join(test_root, "wb-symlink-workspaces")
+      outside_workspace = Path.join(test_root, "wb-symlink-outside")
+      symlink_workspace = Path.join(workspace_root, "MT-2000")
+      File.mkdir_p!(workspace_root)
+      File.mkdir_p!(outside_workspace)
+      File.ln_s!(outside_workspace, symlink_workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
+               AppServer.start_session(symlink_workspace, issue: issue)
+    end
+  end
+
+  describe "start_session/2 partial-start cleanup" do
+    test "an MCP listener bind failure surfaces as an error, not a crash", %{workspace: workspace, issue: issue} do
+      {:ok, occupier} = MCPServer.start_link(tracker_binding: Tracker.bind_agent_tools(), issue: issue)
+
+      try do
+        assert {:error, _reason} =
+                 AppServer.start_session(workspace, issue: issue, mcp_start_opts: [port: occupier.port])
+      after
+        MCPServer.stop(occupier)
+      end
+    end
+
+    test "a --mcp-config write failure stops the just-started MCP listener instead of leaking it", %{
+      workspace: workspace,
+      issue: issue,
+      test_root: test_root
+    } do
+      {:ok, probe} = MCPServer.start_link(tracker_binding: Tracker.bind_agent_tools(), issue: issue)
+      free_port = probe.port
+      assert :ok = MCPServer.stop(probe)
+
+      unwritable_dir = Path.join(test_root, "unwritable-mcp-config-dir")
+      File.mkdir_p!(unwritable_dir)
+      File.chmod!(unwritable_dir, 0o000)
+      on_exit(fn -> File.chmod(unwritable_dir, 0o755) end)
+
+      assert {:error, {:mcp_config_write_failed, _reason}} =
+               AppServer.start_session(workspace,
+                 issue: issue,
+                 mcp_config_dir: unwritable_dir,
+                 mcp_start_opts: [port: free_port]
+               )
+
+      # Proves AppServer's own cleanup (`MCPServer.stop/1` on the config-write failure branch)
+      # actually ran: the port is free again, so a fresh listener can rebind it. A leaked
+      # listener from AppServer's failed attempt would still hold the port, and this rebind
+      # would fail instead.
+      assert {:ok, verifier} =
+               MCPServer.start_link(tracker_binding: Tracker.bind_agent_tools(), issue: issue, port: free_port)
+
+      MCPServer.stop(verifier)
     end
   end
 
@@ -133,6 +213,168 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
       after
         AppServer.stop_session(session_a)
         AppServer.stop_session(session_b)
+      end
+    end
+  end
+
+  describe "run_turn/4 first-turn/resume revert semantics" do
+    test "a process crash before system/init leaves the session first-turn so retry still uses --session-id", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :crash_before_init_once_then_success)
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:error, {:port_exit, 1}} = AppServer.run_turn(session, "prompt", issue, [])
+
+        crashed_argv = File.read!(Path.join(workspace, "argv-crashed.txt"))
+        assert crashed_argv =~ "--session-id"
+
+        assert {:ok, %{session_id: session_id}} = AppServer.run_turn(session, "retry", issue, [])
+        assert session_id == session.session_id
+
+        retry_argv = File.read!(Path.join(workspace, "argv-after-crash.txt"))
+        assert retry_argv =~ "--session-id"
+        refute retry_argv =~ "--resume"
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "a timeout before system/init leaves the session first-turn so retry still uses --session-id", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :silent, claude_code_read_timeout_ms: 100, claude_code_turn_timeout_ms: 5_000)
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:error, :turn_timeout} = AppServer.run_turn(session, "prompt", issue, [])
+
+        # Switch to a fixture that actually completes for the retry — the first attempt's tight
+        # read_timeout_ms already did its job forcing a failure before `system/init`; the retry
+        # only needs to prove which CLI flag it launches with, not race a subprocess against
+        # another tight timeout.
+        write_fake_claude!(workspace, :two_turn_success,
+          claude_code_read_timeout_ms: 5_000,
+          claude_code_turn_timeout_ms: 5_000
+        )
+
+        assert {:ok, %{session_id: session_id}} = AppServer.run_turn(session, "retry", issue, [])
+        assert session_id == session.session_id
+
+        retry_argv = File.read!(Path.join(workspace, "argv-first.txt"))
+        assert retry_argv =~ "--session-id"
+        refute retry_argv =~ "--resume"
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "an executable-not-found launch failure leaves the session first-turn so retry still uses --session-id",
+         %{workspace: workspace, issue: issue} do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(workspace),
+        claude_code_command: "/nonexistent/symphony-claude-binary-#{System.unique_integer([:positive])}"
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:error, {:claude_executable_not_found, _name}} =
+                 AppServer.run_turn(session, "prompt", issue, [])
+
+        write_fake_claude!(workspace, :two_turn_success)
+
+        assert {:ok, %{session_id: session_id}} = AppServer.run_turn(session, "retry", issue, [])
+        assert session_id == session.session_id
+
+        retry_argv = File.read!(Path.join(workspace, "argv-first.txt"))
+        assert retry_argv =~ "--session-id"
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "a turn that fails after system/init does not revert an already-established session", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :crash_mid_turn)
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:error, {:port_exit, 1}} = AppServer.run_turn(session, "prompt", issue, [])
+
+        write_fake_claude!(workspace, :two_turn_success)
+
+        assert {:ok, %{session_id: session_id}} = AppServer.run_turn(session, "retry", issue, [])
+        assert session_id == session.session_id
+
+        resume_argv = File.read!(Path.join(workspace, "argv-resume.txt"))
+        assert resume_argv =~ "--resume"
+        assert resume_argv =~ session_id
+        refute resume_argv =~ "--session-id"
+      after
+        AppServer.stop_session(session)
+      end
+    end
+  end
+
+  describe "run_turn/4 claude_code.command parsing contract" do
+    test "claude_code.command tokenizes as plain whitespace-separated argv, appending extra flags verbatim", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :two_turn_success)
+      base_command = SymphonyElixir.Config.settings!().claude_code.command
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(workspace),
+        claude_code_command: base_command <> " --extra-test-flag"
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        first_argv = File.read!(Path.join(workspace, "argv-first.txt"))
+        assert first_argv =~ "--extra-test-flag"
+      after
+        AppServer.stop_session(session)
+      end
+    end
+
+    test "claude_code.command does not interpret shell quoting — quotes end up as literal argv characters", %{
+      workspace: workspace,
+      issue: issue
+    } do
+      write_fake_claude!(workspace, :two_turn_success)
+      base_command = SymphonyElixir.Config.settings!().claude_code.command
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(workspace),
+        claude_code_command: base_command <> ~s( --append-system-prompt "hello world")
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+
+      try do
+        assert {:ok, _turn} = AppServer.run_turn(session, "prompt", issue, [])
+
+        first_argv = File.read!(Path.join(workspace, "argv-first.txt"))
+        # A real shell would deliver one `hello world` argument; the naive whitespace split
+        # here instead delivers two literal, quote-scarred tokens — this is the documented,
+        # intentional contract (see `resolve_command/0`'s moduledoc comment), not a bug.
+        assert first_argv =~ "\"hello"
+        assert first_argv =~ "world\""
+      after
+        AppServer.stop_session(session)
       end
     end
   end
@@ -443,6 +685,25 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
     #!/bin/sh
     printf '%s\\n' '{"type":"system","subtype":"init","session_id":"observed"}'
     sleep 2
+    """)
+  end
+
+  defp write_fake_claude!(workspace, :crash_before_init_once_then_success, overrides) do
+    # The marker is created with the `: > file` shell builtin (no external `touch` fork/exec)
+    # so it is guaranteed to exist before this process can possibly be killed by a timeout —
+    # the alternative (an external `touch` process) can race against a tight read_timeout_ms
+    # kill under real process-scheduling latency.
+    write_fake_claude_script!(workspace, overrides, """
+    #!/bin/sh
+    if [ -f ./crashed-once.marker ]; then
+      printf '%s\\n' "$@" > "./argv-after-crash.txt"
+      printf '%s\\n' '{"type":"system","subtype":"init","session_id":"observed"}'
+      printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"result":"pong"}'
+    else
+      : > ./crashed-once.marker
+      printf '%s\\n' "$@" > "./argv-crashed.txt"
+      exit 1
+    fi
     """)
   end
 

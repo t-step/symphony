@@ -29,6 +29,9 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
           turn_state: :atomics.atomics_ref()
         }
 
+  # `opts[:mcp_start_opts]`/`opts[:mcp_config_dir]` are deterministic-failure-injection seams for
+  # tests only (default to production behavior when omitted) — not part of the documented public
+  # `start_session/2` contract, which remains `worker_host`/`issue`.
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
@@ -36,7 +39,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     with :ok <- reject_worker_host(worker_host),
          {:ok, issue} <- fetch_issue(opts),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace) do
-      start_session_resources(expanded_workspace, issue)
+      start_session_resources(expanded_workspace, issue, opts)
     end
   end
 
@@ -48,24 +51,42 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
-    first_turn? = :atomics.exchange(turn_state, 1, 1) == 0
+    # Claims (atomically, via exchange — preserving mutual exclusion under any hypothetical
+    # concurrent same-session invocation) the right to launch with `--session-id` instead of
+    # `--resume`. This claim is provisional: it is only allowed to stick if the stream goes on
+    # to actually confirm `system/init` for this call (see `revert_unestablished_claim/3`) —
+    # otherwise a launch/bootstrap failure would permanently and incorrectly leave the session
+    # believing a Claude session was established when the CLI never saw `--session-id` at all.
+    claimed_first_turn? = :atomics.exchange(turn_state, 1, 1) == 0
 
-    case start_port(workspace, prompt, session_id, first_turn?, mcp_config_path) do
+    case start_port(workspace, prompt, session_id, claimed_first_turn?, mcp_config_path) do
       {:ok, port} ->
         Logger.info("Claude Code turn started for #{issue_context(issue)} session_id=#{session_id}")
 
         try do
-          await_turn_completion(port, on_message, session_id)
+          {outcome, phase} = await_turn_completion(port, on_message, session_id)
+          revert_unestablished_claim(turn_state, claimed_first_turn?, phase)
+          outcome
         after
           close_port(port)
         end
 
       {:error, reason} ->
+        revert_unestablished_claim(turn_state, claimed_first_turn?, :bootstrap)
         Logger.error("Claude Code turn failed to launch for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{session_id: session_id, reason: reason})
         {:error, reason}
     end
   end
+
+  # Only the call that actually claimed the first-turn slot (`claimed_first_turn? == true`) may
+  # ever revert it, and only when `system/init` was never observed (`phase != :turn`) — a later
+  # turn's own failure on an already-established session must never re-arm `--session-id`.
+  defp revert_unestablished_claim(turn_state, true, phase) when phase != :turn do
+    :atomics.put(turn_state, 1, 0)
+  end
+
+  defp revert_unestablished_claim(_turn_state, _claimed_first_turn?, _phase), do: :ok
 
   @spec stop_session(session()) :: :ok
   def stop_session(%{mcp_server: mcp_server, mcp_config_path: mcp_config_path}) do
@@ -112,11 +133,13 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
-  defp start_session_resources(workspace, issue) do
+  defp start_session_resources(workspace, issue, opts) do
     dynamic_tool_binding = Tracker.bind_agent_tools()
+    mcp_start_opts = Keyword.get(opts, :mcp_start_opts, [])
 
-    with {:ok, mcp_server} <- MCPServer.start_link(tracker_binding: dynamic_tool_binding, issue: issue) do
-      case write_mcp_config(mcp_server) do
+    with {:ok, mcp_server} <-
+           MCPServer.start_link([tracker_binding: dynamic_tool_binding, issue: issue] ++ mcp_start_opts) do
+      case write_mcp_config(mcp_server, opts) do
         {:ok, mcp_config_path} ->
           {:ok,
            %{
@@ -134,8 +157,9 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
-  defp write_mcp_config(%{port: port, token: token}) do
-    path = Path.join(System.tmp_dir!(), "symphony-claude-mcp-#{System.unique_integer([:positive])}.json")
+  defp write_mcp_config(%{port: port, token: token}, opts) do
+    config_dir = Keyword.get(opts, :mcp_config_dir, System.tmp_dir!())
+    path = Path.join(config_dir, "symphony-claude-mcp-#{System.unique_integer([:positive])}.json")
 
     contents =
       Jason.encode!(%{
@@ -187,6 +211,17 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
+  # `claude_code.command` is deliberately parsed as a plain whitespace-separated argv list
+  # (`String.split/1`, no quote/operator awareness) and spawned directly via
+  # `:spawn_executable` — never a shell string. This is an intentional divergence from
+  # `codex.command`, which is interpolated into a `bash -lc "... && exec <command>"` script and
+  # therefore genuinely supports shell quoting, `env VAR=x <command>` wrapper prefixes, and other
+  # shell operators. `claude_code.command` supports none of that: a value needing an embedded
+  # space inside a single argument (e.g. a quoted flag value) will NOT be tokenized correctly —
+  # it is split on every space regardless of quoting. This trade-off is intentional (it removes
+  # any shell-injection surface for this launch path entirely) and is not merely an oversight;
+  # see contracts/workflow-config-fields.md for the documented contract and
+  # `claude_code_app_server_test.exs`'s "command parsing contract" tests for the exact behavior.
   defp resolve_command do
     case Config.settings!().claude_code.command |> String.split() do
       [] ->
@@ -207,6 +242,10 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
+  # Returns `{outcome, phase}` — `phase` (`:bootstrap` | `:turn`) tells the caller whether
+  # `system/init` was ever actually observed for this call, independent of whether `outcome`
+  # itself is a success or a failure. This is the one piece of information
+  # `revert_unestablished_claim/3` needs and is never exposed outside this module.
   defp await_turn_completion(port, on_message, session_id) do
     receive_loop(port, on_message, session_id, :bootstrap, "")
   end
@@ -220,35 +259,40 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         receive_loop(port, on_message, session_id, phase, pending_line <> to_string(chunk))
 
       {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
+        {{:error, {:port_exit, status}}, phase}
     after
       phase_timeout_ms(phase) ->
-        {:error, :turn_timeout}
+        {{:error, :turn_timeout}, phase}
     end
   end
 
   defp phase_timeout_ms(:bootstrap), do: Config.settings!().claude_code.read_timeout_ms
   defp phase_timeout_ms(:turn), do: Config.settings!().claude_code.turn_timeout_ms
 
-  defp handle_incoming(port, on_message, session_id, _phase, line) do
+  # `phase` is threaded through unchanged for every line that is not the `system/init` event
+  # itself — only `system/init` may advance `:bootstrap` -> `:turn`. (Previously every branch
+  # here hardcoded the next phase to `:turn`, so any pre-init noise line — a stray non-JSON
+  # line, an out-of-order `system` event, anything at all — silently ended the bootstrap-phase
+  # timeout window before `system/init` had actually been seen.)
+  defp handle_incoming(port, on_message, session_id, phase, line) do
     case Jason.decode(line) do
       {:ok, %{"type" => "system", "subtype" => "init"} = payload} ->
         emit_message(on_message, :session_started, %{session_id: session_id, raw: payload})
         receive_loop(port, on_message, session_id, :turn, "")
 
       {:ok, %{"type" => "result"} = payload} ->
-        handle_result(payload, on_message, session_id)
+        {handle_result(payload, on_message, session_id), phase}
 
       {:ok, %{"type" => type} = payload} when is_binary(type) ->
         emit_message(on_message, :notification, %{session_id: session_id, raw: payload})
-        receive_loop(port, on_message, session_id, :turn, "")
+        receive_loop(port, on_message, session_id, phase, "")
 
       {:ok, _payload} ->
-        receive_loop(port, on_message, session_id, :turn, "")
+        receive_loop(port, on_message, session_id, phase, "")
 
       {:error, _reason} ->
         log_non_json_stream_line(line)
-        receive_loop(port, on_message, session_id, :turn, "")
+        receive_loop(port, on_message, session_id, phase, "")
     end
   end
 

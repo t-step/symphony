@@ -25,6 +25,15 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.AgentRunner,
           SymphonyElixir.Application,
           SymphonyElixir.CLI,
+          # Codex.AppServer/ClaudeCode.AppServer: reassessed during the T022/T023 adversarial-review
+          # repair (2026-08-25) rather than accepted on precedent alone. Both remain excluded for the
+          # genuinely nondeterministic-to-hit-100%-via-fixtures Port/OS-process branches (e.g.
+          # `close_port/1`'s `:erlang.port_info/1 == :undefined` race, `kill_os_process/1`'s rescue
+          # clauses, mid-teardown timing) — not because the whole module is "hard to test." The
+          # deterministic, security-sensitive logic each module actually contains (workspace-cwd
+          # boundary validation, partial-start resource cleanup, first-turn/resume state semantics)
+          # is directly exercised by dedicated tests in each module's own test file, even though this
+          # exclusion means those lines aren't counted toward the 100% figure below.
           SymphonyElixir.Codex.AppServer,
           SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.ClaudeCode.AppServer,

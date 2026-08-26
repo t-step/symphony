@@ -970,3 +970,86 @@ of which is safe or deterministic to manufacture in a live smoke check): the fai
 `:failure_result`/`:malformed_result` fixtures, not the real CLI.
 
 No other planning artifact was changed by this addendum, per T022/T023's scope.
+
+## Repair Addendum (2026-08-26): T022/T023 adversarial-review repair
+
+**Scope**: an independent adversarial review of commit `918f845` (T022/T023) found one BLOCKING and two
+MAJOR findings, plus several MINOR/NOTE items. This addendum records the repair, still scoped to T022/T023
+only — no T027+ work was started or touched.
+
+**1. First-turn/resume state machine (BLOCKING, fixed).** `run_turn/4` previously flipped its `:atomics`
+first-turn flag unconditionally at call entry, before confirming the launch or the CLI ever established a
+session. A launch/bootstrap failure (missing executable, process crash or timeout before `system/init`)
+left the flag permanently flipped, so any retry of `run_turn/4` on the *same* session would incorrectly
+launch with `--resume <uuid>` against a session the CLI never created. Not reachable via any current
+production caller (`AgentRunner` never retries `run_turn/4` on the same session; the Orchestrator always
+retries via a brand-new `AgentRunner.run/3` call, which gets a brand-new session and a fresh atomics ref),
+but a real, provable defect that any future same-session retry logic would trigger silently. Fixed: the
+`:atomics.exchange/3` claim at entry is now provisional — it is reverted back to 0 (`revert_unestablished_claim/3`)
+whenever the call that made the claim never observed `system/init` (tracked via the receive loop's own
+`:bootstrap`/`:turn` phase, now returned alongside the outcome), and only that claiming call is ever allowed
+to revert it, so a later turn's own failure on an *already-established* session never re-arms
+`--session-id`. This also required fixing a second, closely-related bug uncovered while implementing the
+fix: `handle_incoming/5` previously hardcoded the *next* phase to `:turn` on every branch except the
+literal `system/init` line — meaning any pre-init noise (a stray non-JSON line, an out-of-order `system`
+event) silently ended the bootstrap-phase timeout window before `system/init` had actually been seen. Now
+`phase` is threaded through unchanged except on the actual `system/init` transition. Four new regression
+tests in `claude_code_app_server_test.exs` (describe block "run_turn/4 first-turn/resume revert
+semantics") cover: crash before init, timeout before init, executable-not-found before init (all three
+prove a same-session retry still uses `--session-id`), and a turn that fails *after* init (proving a retry
+correctly still uses `--resume`, i.e. the fix does not over-revert).
+
+**2. Coverage exclusion (MAJOR, addressed).** The review found `validate_workspace_cwd/1`'s duplicated
+branches and the partial-start cleanup paths (`write_mcp_config/2` failure after listener start,
+`MCPServer.start_link/1` failure) had zero test coverage anywhere, hidden by the module-wide
+`ignore_modules` entry — unlike the identical logic in `Codex.AppServer`, which its own test suite already
+exercises directly. Repaired by adding: three workspace-boundary tests (workspace root itself, a path
+outside the workspace root, a symlink escape), mirroring `app_server_test.exs`'s existing Codex precedent
+exactly; and two partial-start cleanup tests (an MCP listener bind failure via a deterministic port
+collision, and a `--mcp-config` write failure via an unwritable directory, the latter proving the
+just-started listener was actually stopped by rebinding the same port afterward). Two small,
+purely-additive test-injection seams were added to `start_session/2`'s `opts` to make these deterministic:
+`opts[:mcp_start_opts]` (forwarded into `MCPServer.start_link/1`, e.g. to force a `:port` collision) and
+`opts[:mcp_config_dir]` (overrides where the `--mcp-config` temp file is written, e.g. to an unwritable
+directory) — both default to today's production behavior when omitted and are not part of the documented
+public `start_session/2` contract. The module-wide `ignore_modules` entry is **retained** (see `mix.exs`'s
+own comment there): the module still contains genuinely nondeterministic-to-hit Port/OS-process branches
+(e.g. `close_port/1`'s `:erlang.port_info/1 == :undefined` race, `kill_os_process/1`'s rescue clauses) that
+these new tests do not attempt to force. This was a reassessed decision, not the original commit's
+precedent accepted at face value.
+
+**3. `claude_code.command` parsing semantics (MAJOR, documented, behavior retained).** The review found
+`claude_code.command` is parsed as a naive whitespace-split argv list while `codex.command` is a genuine
+shell command line (interpolated into `bash -lc`), despite both being documented as "same shape class."
+Decision: **retain** direct-executable-spawning + whitespace-split argv (no repository evidence favors
+switching to a shell wrapper, and the current approach removes any shell-injection surface entirely) but
+make the contract explicit rather than silently ambiguous. Documented in
+`contracts/workflow-config-fields.md` and in `ClaudeCode.AppServer.resolve_command/0`'s own doc comment;
+pinned down with two new tests ("run_turn/4 claude_code.command parsing contract") proving both the
+supported case (appending extra whitespace-separated flags) and the explicitly-unsupported case (shell
+quoting is not honored — quote characters end up as literal, split argv content).
+
+**4. `opts[:issue]` contract documentation (MINOR, fixed).** `contracts/coding-agent-behaviour.md`'s
+`start_session/2` Input section documented `opts` as "at minimum `worker_host`" without ever mentioning
+`:issue`, even though `ClaudeCode.AppServer.start_session/2` already required it. Confirmed this was a
+documentation gap, not an architectural violation: `Codex.AppServer.start_session/2` only reads
+`opts[:worker_host]` and ignores unrecognized keys, so passing `issue: issue` unconditionally (regardless
+of which concrete `CodingAgent` module is active) is harmless to Codex and does not require
+provider-aware branching in any caller. The contract doc now says so explicitly.
+
+**Constraints this repair leaves for T027 (unchanged from the original review, restated for the record):**
+- T027 must pass `issue: issue` into `start_session/2`'s opts unconditionally when resolving the concrete
+  `CodingAgent` module — `issue` is already in lexical scope at `agent_runner.ex`'s only `start_session/2`
+  call site (`run_codex_turns/5`), so this is a small, mechanical addition, not a redesign.
+- The Orchestrator's stall-timeout watchdog (`orchestrator.ex:582`) reads `Config.settings!().codex.stall_timeout_ms`
+  unconditionally — there is no `claude_code.stall_timeout_ms` field. Once T027 wires dispatch, a
+  Claude-Code-backed run's stall watchdog will silently be governed by the *Codex* config value regardless
+  of `agent_execution.kind`. Not fixed here (explicitly out of scope for this repair — no
+  provider-aware orchestrator stall-timeout selection was implemented); T027 (or an explicit follow-up
+  task) must decide whether that shared knob is acceptable or needs its own `claude_code.stall_timeout_ms`
+  field plus a kind-aware lookup.
+- The ~3s CLI stdin-wait latency (documented in the R6/R6a/R7 addendum above) was left as-is per this
+  repair's explicit scope — it is a latency note, not a correctness defect, and expanding this repair
+  around it was out of scope.
+
+No T027 (or later) production code was touched by this repair.
