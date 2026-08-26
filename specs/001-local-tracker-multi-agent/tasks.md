@@ -116,7 +116,8 @@ description: "Task list for Local Work Tracking and Selectable Coding-Agent Exec
 
 - [x] T035 [P] Update `elixir/AGENTS.md` (Docs Update Policy) documenting `tracker.kind: local`, `symphony local-tracker init`, `agent_execution.kind`, and `claude_code.*` as new `WORKFLOW.md` surface
 - [x] T036 Run `make all` (format check, `mix specs.check`, `credo --strict`, coverage at the existing 100% threshold, dialyzer) across the full tree including every new module and test, and fix any gate failure (depends on T001–T034)
-- [ ] T037 Execute `quickstart.md` Scenarios 1–3 front-to-back exactly as written and record results (depends on T036)
+- [x] T036A Document the `tracker.kind: local` local work-tracking source (including `symphony local-tracker init`) and the `agent_execution.kind`/`claude_code.*` Claude Code execution surface in `elixir/README.md` (operator setup/config, adapter-profile style) and `SPEC.md` (normative extension appendix), so both are discoverable/configurable the same way every existing tracker/execution surface already is; no code or task-content changes (depends on T035)
+- [ ] T037 Execute `quickstart.md` Scenarios 1–3 front-to-back exactly as written and record results (depends on T036, T036A)
 
 ---
 

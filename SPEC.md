@@ -2310,3 +2310,78 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Appendix B. Local Work-Tracking Extension (OPTIONAL)
+
+This appendix describes an OPTIONAL `tracker.kind` value that tracks work in a local file instead of
+a hosted tracker, so a deployment can operate with zero hosted-tracker/control-plane dependency.
+
+Extension config:
+
+- `tracker.kind: local` selects this adapter, using the same top-level `tracker.kind` field §5.3.1
+  already defines.
+- `tracker.provider.path` (string, OPTIONAL, implementation-defined default)
+  - The local data file's location.
+  - Unlike every other tracker kind's `tracker.provider.*`, this field SHOULD be treated as
+    **structural** (read once at process start, alongside `tracker.kind`) rather than dynamically
+    reloaded: changing which file is read mid-run changes the *identity* of the tracked dataset, not
+    just how to reach the same one, and a live switch would make every issue from the previous file
+    look deleted to the orchestrator.
+
+Behavior:
+
+- No network access and no secret/credential fields — the adapter's `secret_environment_names`
+  MUST be empty.
+- Every record this adapter produces is dispatchable; there is no archived/withdrawn concept.
+- This adapter MUST already be explicitly initialized (data provisioned at the configured path)
+  before startup validation succeeds; an implementation MUST NOT silently create the store's
+  initial content as a side effect of ordinary startup or polling. An explicit, separate
+  initialization operation is REQUIRED for provisioning it.
+- Concurrent writes from multiple in-process run attempts MUST be serialized so no update is lost;
+  concurrent writers from separate OS processes/hosts are out of scope.
+
+Operator-facing configuration, initialization command, and error surface for this extension are
+documented in the reference implementation's `elixir/README.md` ("Local tracker").
+
+## Appendix C. Claude Code Agent Execution Extension (OPTIONAL)
+
+This appendix describes an OPTIONAL second coding-agent execution integration, selectable
+alongside the Codex integration §10 already defines, so a deployment can choose which coding agent
+executes issue attempts without changing orchestration, scheduling, or workspace behavior.
+
+Extension config:
+
+- `agent_execution.kind` (string, OPTIONAL, default `"codex"`)
+  - Selects the coding-agent execution integration: `"codex"` or `"claude_code"`.
+  - The `agent_execution` top-level key is owned by this extension.
+  - **Structural**, same class as `tracker.kind`: read once at process start; a live edit takes
+    effect only on the next restart.
+- `claude_code.*` (object, OPTIONAL)
+  - Sibling embed to `codex.*` (§5.3.6), same shape class (launch command, timeouts). Reloads
+    dynamically exactly as `codex.*` already does — this is a coding-agent *runtime* setting, not
+    an execution-integration *selection*.
+  - The `claude_code` top-level key is owned by this extension.
+
+Execution model:
+
+- This integration satisfies the same language-neutral Agent Runner responsibilities §10 already
+  requires of a coding-agent integration (workspace cwd, session/turn identifiers, streaming turn
+  processing, emitted runtime events, continuation handling) against the targeted `claude` CLI's
+  own protocol instead of a Codex app-server. The installed `claude` CLI's own documentation is the
+  source of truth for its invocation flags, output format, and event names, exactly as §10 already
+  treats the targeted Codex app-server version as the protocol source of truth for Codex.
+  - Session/turn identifiers follow the launched CLI's own session semantics rather than a Codex
+    `thread_id`/`turn_id` pair.
+- This integration does not support remote worker hosts: `agent_execution.kind: claude_code`
+  combined with a non-empty `worker.ssh_hosts` (Appendix A) MUST fail startup validation. Use
+  `agent_execution.kind: codex` for SSH-worker deployments.
+- An implementation's default `claude_code.*` invocation SHOULD authenticate via the operator's
+  own already-authenticated CLI session (subscription/OAuth) rather than requiring a separate API
+  key, while still excluding ambient, user-global CLI configuration from the launched process —
+  only the target repository's own project-scoped configuration and MCP configuration are
+  admitted, composed alongside the implementation's own generated MCP configuration, which MUST
+  remain authoritative on any same-name collision.
+
+Operator-facing configuration, defaults, the exact authentication/trust model, and MCP composition
+behavior for this extension are documented in the reference implementation's `elixir/README.md`
+("Claude Code execution").

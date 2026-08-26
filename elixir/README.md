@@ -287,6 +287,117 @@ codex:
 - `gitlab_api` forwards raw GitLab REST requests with host-side auth and keeps configured tracker
   credentials and provider authentication aliases out of the Codex child.
 
+### Local tracker
+
+Use `tracker.kind: local` to track work in a local JSON file instead of a hosted tracker — no
+tracker account, API token, or network access required.
+
+- Config: `tracker.provider.path` (default `.symphony/local_tracker.json`, resolved relative to
+  the directory containing `WORKFLOW.md`) is the data file location. Like `tracker.kind` itself,
+  `tracker.provider.path` is **structural** under `tracker.kind: local`: it is read once at
+  startup, and editing it while Symphony is running only takes effect after a restart. This is
+  narrower than every other adapter's `tracker.provider.*`, which stays live-reloadable, because
+  changing this path mid-run would silently swap in a different dataset rather than just changing
+  how to reach the same one.
+- Initialization: Symphony never creates the data file or its establishment marker
+  (`<path>.established`) implicitly. Before starting Symphony against a given path, run:
+
+  ```bash
+  ./bin/symphony local-tracker init [--reset] [path-to-WORKFLOW.md]
+  ```
+
+  This resolves `tracker.provider.path` from the given `WORKFLOW.md` (default `./WORKFLOW.md`) and
+  atomically creates the data file and marker; it does not start the orchestrator. Re-running
+  `init` against an already-established store refuses unless `--reset` is passed. `--reset` deletes
+  and recreates both files. If the data file exists and parses but the marker is missing, `init`
+  completes establishment by writing only the marker, leaving the data untouched. Startup (and
+  every dispatch tick) fails clearly with `local_tracker_not_initialized` or
+  `local_tracker_ambiguous_state` if the store hasn't been established yet at the configured path.
+- States: default `active_states` are `todo`, `in_progress`, `blocked`; default `terminal_states`
+  are `done`, `cancelled` — override with `tracker.active_states`/`tracker.terminal_states` exactly
+  like any other adapter. Every issue this adapter returns is `dispatchable: true`; there is no
+  archived/withdrawn concept.
+- Tool: advertises `local_tracker_set_state` (input: `{"state": "<new state>"}`), scoped to the
+  current session's bound issue only — it cannot target an arbitrary issue ID. Setting the same
+  value again is a no-op success.
+- Concurrency: reads and the one write are serialized through a single in-process store, so
+  concurrent attempts for different issues cannot lose an update. This covers concurrency within
+  one Symphony deployment only — it is not a multi-process/multi-host file-locking protocol.
+- Scheduling, retries, concurrency limits, and reconciliation behave exactly as with any hosted
+  tracker; only how work is read and written changes.
+
+## Agent execution
+
+`agent_execution.kind` selects the coding-agent integration Symphony launches per issue attempt:
+`codex` (default) or `claude_code`. Like `tracker.kind`, `agent_execution.kind` is **structural** —
+read once at startup, so a live edit only takes effect after a restart. A deployment that never
+sets `agent_execution.kind` keeps running Codex unchanged.
+
+Codex execution uses the `codex.*` fields already documented under
+[Configuration](#configuration).
+
+### Claude Code execution
+
+Set `agent_execution.kind: claude_code` to run issues through the installed `claude` CLI instead
+of Codex. Configure it under `claude_code`:
+
+- `claude_code.command` (default: `claude --setting-sources project,local --permission-mode
+  bypassPermissions --strict-mcp-config`) — the `claude` CLI invocation. Unlike `codex.command`,
+  this string is parsed as a plain whitespace-separated argument list and launched directly with no
+  shell involved, so it does not support shell quoting, `env VAR=x ...` prefixes, or any argument
+  value containing an embedded space.
+- `claude_code.turn_timeout_ms` (default `3600000`) and `claude_code.read_timeout_ms` (default
+  `5000`) — the same meaning as their `codex.*` counterparts (turn-stream silence timeout and
+  session-startup timeout, respectively).
+
+Authentication and trust model, for the default `claude_code.command` above:
+
+- Symphony does not require or synthesize `ANTHROPIC_API_KEY`. Authentication is delegated
+  entirely to the installed `claude` CLI's own subscription/OAuth login on the host machine —
+  Symphony neither performs nor manages that login.
+- `--setting-sources project,local` admits the workspace's own `CLAUDE.md`/`.claude/settings.json`
+  and `.claude/settings.local.json`, but excludes user-global Claude settings (`~/.claude/...`).
+- `--strict-mcp-config` stays on. Symphony still composes the workspace's own `.mcp.json` (when
+  present at the workspace root) together with Symphony's own generated MCP config under one
+  `--mcp-config` invocation: the repo's file is supplied first, and Symphony's own generated config
+  is always supplied last, so Symphony's `symphony_tracker` MCP server is authoritative on any
+  same-name collision. No other MCP source is admitted.
+- Headless (`-p`) mode never shows Claude Code's interactive trust prompt, so a workspace's own
+  hooks and `.mcp.json` servers run the first time a `claude_code` turn starts against it, with no
+  separate approval step — the same trust boundary Symphony already has for Codex-launched
+  repository code, not a new one.
+- Repository-checked-in subagents and `@skills-dir` plugins do not load in headless mode; this is
+  a `claude` CLI limitation and not something Symphony works around.
+- For the strictest, config-blind, API-key-only isolation instead of this default, set
+  `claude_code.command` to include `--bare` and provide `ANTHROPIC_API_KEY` in Symphony's
+  environment.
+- Remote worker hosts are not supported for `claude_code` execution: `agent_execution.kind:
+  claude_code` combined with a non-empty `worker.ssh_hosts` fails startup validation. Use
+  `agent_execution.kind: codex` (the default) for SSH-worker deployments.
+
+Minimal example combining the local tracker with Claude Code execution:
+
+```md
+---
+tracker:
+  kind: local
+  provider:
+    path: .symphony/local_tracker.json
+workspace:
+  root: ~/code/workspaces
+agent_execution:
+  kind: claude_code
+claude_code:
+  command: claude --setting-sources project,local --permission-mode bypassPermissions --strict-mcp-config
+---
+
+You are working on an issue from the configured tracker {{ issue.identifier }}.
+
+Title: {{ issue.title }} Body: {{ issue.description }}
+```
+
+Run `./bin/symphony local-tracker init` once against this file before starting Symphony.
+
 ## Web dashboard
 
 The observability UI now runs on a minimal Phoenix stack:
