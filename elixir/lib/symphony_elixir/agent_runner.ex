@@ -1,11 +1,12 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single tracker work item in its workspace with Codex.
+  Executes a single tracker work item in its workspace using the configured
+  coding-agent execution integration (`agent_execution.kind`: Codex by
+  default, or Claude Code — `SymphonyElixir.CodingAgent.resolve/0`).
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{CodingAgent, Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -88,21 +89,47 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    coding_agent = CodingAgent.resolve()
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    start_opts = [worker_host: worker_host, issue: issue]
+
+    # `issue: issue` is passed unconditionally alongside `worker_host` — Claude Code requires it
+    # to bind its per-run MCP listener at `start_session/2` time (contracts/coding-agent-behaviour.md);
+    # Codex ignores unrecognized opts keys, so this stays harmless and provider-agnostic for it.
+    with {:ok, session} <- coding_agent.start_session(workspace, start_opts) do
+      run_state = %{
+        coding_agent: coding_agent,
+        session: session,
+        workspace: workspace,
+        codex_update_recipient: codex_update_recipient,
+        opts: opts,
+        issue_state_fetcher: issue_state_fetcher,
+        max_turns: max_turns
+      }
+
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(run_state, issue, 1)
       after
-        AppServer.stop_session(session)
+        coding_agent.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(run_state, issue, turn_number) do
+    %{
+      coding_agent: coding_agent,
+      session: app_session,
+      workspace: workspace,
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      max_turns: max_turns
+    } = run_state
+
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           coding_agent.run_turn(
              app_session,
              prompt,
              issue,
@@ -114,16 +141,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+          do_run_codex_turns(run_state, refreshed_issue, turn_number + 1)
 
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")

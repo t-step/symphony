@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.{Config.Schema, Tracker}
+  alias SymphonyElixir.{CodingAgent, Config.Schema, Tracker}
   alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
@@ -153,7 +153,9 @@ defmodule SymphonyElixir.Config do
         {:error, {:invalid_workflow_config, @claude_code_worker_host_message}}
 
       true ->
-        Tracker.validate_config(settings.tracker)
+        with {:ok, _coding_agent} <- CodingAgent.for_kind(settings.agent_execution.kind) do
+          Tracker.validate_config(settings.tracker)
+        end
     end
   end
 

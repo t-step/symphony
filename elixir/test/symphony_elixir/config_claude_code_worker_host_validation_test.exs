@@ -82,4 +82,11 @@ defmodule SymphonyElixir.ConfigClaudeCodeWorkerHostValidationTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "claude_code.read_timeout_ms"
   end
+
+  test "an unsupported agent_execution.kind fails startup validation instead of silently resolving (T027)" do
+    write_workflow_file!(Workflow.workflow_file_path(), agent_execution_kind: "not-a-real-kind")
+
+    assert {:error, reason} = Config.validate!()
+    assert reason == {:unsupported_agent_execution_kind, "not-a-real-kind"}
+  end
 end

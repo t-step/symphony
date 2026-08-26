@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CodingAgentTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.CodingAgent
+
   test "Codex.AppServer satisfies the fixed-session CodingAgent contract across multiple turns" do
     test_root =
       Path.join(
@@ -102,6 +104,38 @@ defmodule SymphonyElixir.CodingAgentTest do
       assert :ok = AppServer.stop_session(session)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  describe "CodingAgent.for_kind/1 and resolve/0 (T027 dispatch resolution)" do
+    test "for_kind/1 maps each known agent_execution.kind to its implementation module" do
+      assert {:ok, SymphonyElixir.Codex.AppServer} = CodingAgent.for_kind("codex")
+      assert {:ok, SymphonyElixir.ClaudeCode.AppServer} = CodingAgent.for_kind("claude_code")
+    end
+
+    test "for_kind/1 rejects an unsupported kind instead of silently defaulting" do
+      assert {:error, {:unsupported_agent_execution_kind, "not-a-real-kind"}} =
+               CodingAgent.for_kind("not-a-real-kind")
+
+      assert {:error, {:unsupported_agent_execution_kind, nil}} = CodingAgent.for_kind(nil)
+    end
+
+    test "resolve/0 reads the structural (restart-only) agent_execution.kind pin, not a live edit" do
+      write_workflow_file!(Workflow.workflow_file_path(), agent_execution_kind: "codex")
+      restart_workflow_store!()
+
+      assert CodingAgent.resolve() == SymphonyElixir.Codex.AppServer
+
+      write_workflow_file!(Workflow.workflow_file_path(), agent_execution_kind: "claude_code")
+
+      assert Config.settings!().agent_execution.kind == "claude_code"
+
+      assert CodingAgent.resolve() == SymphonyElixir.Codex.AppServer,
+             "resolve/0 must stay pinned to the structural selection until an actual restart"
+
+      restart_workflow_store!()
+
+      assert CodingAgent.resolve() == SymphonyElixir.ClaudeCode.AppServer
     end
   end
 end

@@ -578,6 +578,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Deliberately reads `codex.stall_timeout_ms` unconditionally, regardless of the active
+  # `agent_execution.kind` (T027 confirmed this once dispatch made Claude Code reachable through
+  # ordinary execution): spec.md's IV-002 requires stall-detection *timing* to "remain unchanged
+  # regardless of which coding-agent execution integration a run uses", so a provider-specific
+  # `claude_code.stall_timeout_ms` value would violate that invariant rather than satisfy it.
+  # There is intentionally no `claude_code.stall_timeout_ms` field (T024 scoped that embed to
+  # `command`/`turn_timeout_ms`/`read_timeout_ms` only).
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
 
