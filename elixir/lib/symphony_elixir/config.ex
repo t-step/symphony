@@ -43,11 +43,11 @@ defmodule SymphonyElixir.Config do
   end
 
   @doc """
-  The structural (restart-only) configuration selection captured once at
-  process start — currently `tracker.kind` (IV-005; research.md R9). Never
-  reflects a later `WORKFLOW.md` edit until the next restart. Later tasks add
-  `tracker.provider.path` (once `tracker.kind: local` is a registered
-  adapter) and `agent_execution.kind` (once that field exists) to this map.
+  The structural (restart-only) configuration selections captured once at
+  process start — `tracker.kind` and `agent_execution.kind` (IV-005;
+  research.md R9), plus `tracker.provider.path` when `tracker.kind: local`
+  (research.md R9a). Never reflects a later `WORKFLOW.md` edit until the next
+  restart.
   """
   @spec structural_settings!() :: map()
   def structural_settings! do
@@ -139,13 +139,21 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @claude_code_worker_host_message "Claude Code execution does not support remote worker hosts in " <>
+                                     "this release; unset `worker.ssh_hosts` or use `agent_execution.kind: codex`"
+
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
-    if is_nil(settings.tracker.kind) do
-      {:error, :missing_tracker_kind}
-    else
-      Tracker.validate_config(settings.tracker)
+    cond do
+      is_nil(settings.tracker.kind) ->
+        {:error, :missing_tracker_kind}
+
+      settings.agent_execution.kind == "claude_code" and settings.worker.ssh_hosts != [] ->
+        {:error, {:invalid_workflow_config, @claude_code_worker_host_message}}
+
+      true ->
+        Tracker.validate_config(settings.tracker)
     end
   end
 

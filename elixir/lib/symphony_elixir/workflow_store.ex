@@ -213,19 +213,19 @@ defmodule SymphonyElixir.WorkflowStore do
 
   # Structural (restart-only) selections, per IV-005/research.md R9/R9a. Computed once at
   # process start (`init/1`) and preserved unchanged across every later reload (`reload_path/2`)
-  # regardless of how many times `WORKFLOW.md` changes afterward. `agent_execution_kind` is added
-  # to this map by a later task as its prerequisite field lands.
-  defp compute_structural(%Schema{tracker: %{kind: "local"} = tracker} = _settings, path) do
+  # regardless of how many times `WORKFLOW.md` changes afterward.
+  defp compute_structural(%Schema{tracker: %{kind: "local"} = tracker} = settings, path) do
     workflow_dir = path |> Path.expand() |> Path.dirname()
 
     %{
       tracker_kind: tracker.kind,
-      tracker_provider_path: Local.Adapter.resolve_provider_path(tracker.provider, workflow_dir)
+      tracker_provider_path: Local.Adapter.resolve_provider_path(tracker.provider, workflow_dir),
+      agent_execution_kind: settings.agent_execution.kind
     }
   end
 
   defp compute_structural(%Schema{} = settings, _path) do
-    %{tracker_kind: settings.tracker.kind}
+    %{tracker_kind: settings.tracker.kind, agent_execution_kind: settings.agent_execution.kind}
   end
 
   # `Local.Store` is a named singleton, started only when `tracker.kind: local` is the active

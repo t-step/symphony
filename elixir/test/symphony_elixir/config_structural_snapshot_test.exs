@@ -31,6 +31,25 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
     assert Tracker.bind_agent_tools().secret_environment_names == []
   end
 
+  test "a live agent_execution.kind edit does not take effect until the WorkflowStore restarts" do
+    write_workflow_file!(Workflow.workflow_file_path(), agent_execution_kind: "codex")
+    restart_workflow_store!()
+
+    assert Config.structural_settings!().agent_execution_kind == "codex"
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_execution_kind: "claude_code")
+
+    assert Config.settings!().agent_execution.kind == "claude_code"
+
+    assert Config.structural_settings!().agent_execution_kind == "codex",
+           "agent_execution.kind must stay pinned to the original structural selection until an " <>
+             "actual restart, even though the live-reloaded value already reads \"claude_code\""
+
+    restart_workflow_store!()
+
+    assert Config.structural_settings!().agent_execution_kind == "claude_code"
+  end
+
   test "a non-tracker.kind dynamic field still reloads live without a restart" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
