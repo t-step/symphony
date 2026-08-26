@@ -116,6 +116,37 @@ defmodule SymphonyElixir.AgentRunnerDispatchTest do
     refute env_dump =~ "SYMPHONY_TEST_UNRELATED_VAR"
   end
 
+  test "a codex-backed run excludes ANTHROPIC_API_KEY and other unrelated env from the subprocess", %{
+    test_root: test_root,
+    workspace_root: workspace_root,
+    issue: issue
+  } do
+    codex_binary = write_fake_codex_env_dump!(test_root)
+
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
+    System.put_env("SYMPHONY_TEST_UNRELATED_VAR", "should-still-be-present")
+
+    on_exit(fn ->
+      System.delete_env("ANTHROPIC_API_KEY")
+      System.delete_env("SYMPHONY_TEST_UNRELATED_VAR")
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      agent_execution_kind: "codex",
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    restart_workflow_store!()
+
+    assert :ok = AgentRunner.run(issue)
+
+    env_dump = File.read!(Path.join(test_root, "codex-env.txt"))
+    refute env_dump =~ "ANTHROPIC_API_KEY"
+    refute env_dump =~ "sk-ant-should-not-leak"
+    assert env_dump =~ "SYMPHONY_TEST_UNRELATED_VAR"
+  end
+
   test "dispatch selection comes from the pinned structural snapshot, not a live-reloaded edit", %{
     test_root: test_root,
     workspace_root: workspace_root,
@@ -170,6 +201,34 @@ defmodule SymphonyElixir.AgentRunnerDispatchTest do
     File.write!(codex_binary, """
     #!/bin/sh
     touch #{shell_quote(marker_path)}
+    count=0
+    while IFS= read -r _line; do
+      count=$((count + 1))
+      case "$count" in
+        1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        2) ;;
+        3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-dispatch"}}}' ;;
+        4)
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-dispatch"}}}'
+          printf '%s\\n' '{"method":"turn/completed"}'
+          exit 0
+          ;;
+        *) exit 0 ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    codex_binary
+  end
+
+  defp write_fake_codex_env_dump!(test_root) do
+    codex_binary = Path.join(test_root, "fake-codex-env-dump")
+    env_dump_path = Path.join(test_root, "codex-env.txt")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    env > #{shell_quote(env_dump_path)}
     count=0
     while IFS= read -r _line; do
       count=$((count + 1))

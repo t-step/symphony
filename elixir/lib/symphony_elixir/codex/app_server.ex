@@ -13,6 +13,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  # The *other* coding-agent integration's credential env var(s) (Claude Code's
+  # `ANTHROPIC_API_KEY`, per `ClaudeCode.AppServer`'s `@allowed_env_names`). Stripped from every
+  # Codex subprocess — local and remote — symmetric to how the Claude Code launch path excludes
+  # `OPENAI_API_KEY`/other unrelated env, so an ambient `ANTHROPIC_API_KEY` in Symphony's own
+  # environment is never inherited by a Codex-backed subprocess (FR-009).
+  @foreign_agent_credential_env_names ~w(ANTHROPIC_API_KEY)
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -240,16 +246,26 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
-    |> valid_environment_names()
+    dynamic_tool_binding
+    |> stripped_env_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
   defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+    case stripped_env_names(dynamic_tool_binding) do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
+  end
+
+  # Tracker-secret names (validated/sanitized, since they come from configurable dynamic tool
+  # bindings) plus the static, developer-controlled foreign-agent credential names (no
+  # sanitizing needed — they are literals, not user input), deduplicated so a name that happened
+  # to appear in both sets is never emitted twice in the `unset` command.
+  defp stripped_env_names(dynamic_tool_binding) do
+    ((dynamic_tool_binding.secret_environment_names
+      |> valid_environment_names()) ++ @foreign_agent_credential_env_names)
+    |> Enum.uniq()
   end
 
   defp valid_environment_names(names) do

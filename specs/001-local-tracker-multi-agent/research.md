@@ -676,7 +676,8 @@ FR-008.2) instead of silently prompting for a login Symphony can never answer. F
 pattern `Codex.AppServer.tracker_secret_unset_command/1` and `tracker_secret_port_env/1` already use to
 strip tracker secrets from the Codex child's environment, the Claude Code launch environment explicitly
 excludes `OPENAI_API_KEY`/Codex's own auth file, and the Codex launch environment (unchanged) continues
-to exclude `ANTHROPIC_API_KEY`.
+to exclude `ANTHROPIC_API_KEY` (see the FR-009 Symmetry Correction Addendum below — this property is
+only *actively enforced* as of that repair).
 
 **Rationale/evidence**: FR-009 is a hard requirement ("MUST NOT be required by, or leak into, another
 coding-agent execution integration"). Since FR-010 already guarantees only one coding-agent execution
@@ -1259,3 +1260,46 @@ wording (the memory-tracker seeding mechanism is explicitly deferred to "test-fi
 `quickstart.md`/`README.md` text was changed.
 
 No other planning artifact was changed by this addendum, per T037's scope.
+
+## FR-009 Symmetry Correction Addendum (2026-08-26): Codex now actively strips Claude credentials
+
+**Correction**: R8's statement that "the Codex launch environment (unchanged) continues to exclude
+`ANTHROPIC_API_KEY`" was aspirational, not accurate as of when it was written. Prior to this addendum's
+repair, `Codex.AppServer`'s `tracker_secret_port_env/1` and `tracker_secret_unset_command/1` stripped
+only the *active tracker's own* secret environment variable names from the Codex subprocess's
+environment (local `Port.open` `env:` option, and the `unset ...` prefix in the `bash -lc` launch
+script used by both the local and remote/SSH launch paths). Neither stripped Claude Code's credential
+(`ANTHROPIC_API_KEY`). So if `ANTHROPIC_API_KEY` was present in Symphony's own parent environment — e.g.
+because the same deployment also runs, or once ran, Claude Code — a Codex-backed subprocess inherited it
+unmodified. Codex subprocesses execute arbitrary repository code (the same trust model that already
+governs Codex's own tool/shell execution), so this was a genuine FR-009 violation in the Codex→Claude
+direction: the asymmetric partner to the Claude→Codex direction R8 correctly implemented via
+`@allowed_env_names`/`claude_subprocess_env/0`.
+
+**Repair**: `Codex.AppServer` now also strips `ANTHROPIC_API_KEY` — the Claude Code integration's one
+credential variable, per `ClaudeCode.AppServer`'s own `@allowed_env_names` allow-list — from the Codex
+subprocess environment, via a new `@foreign_agent_credential_env_names ~w(ANTHROPIC_API_KEY)` module
+attribute. This is applied on **both** launch paths: the local `env:` option built by
+`tracker_secret_port_env/1`, and the `unset <names>` bash command built by `tracker_secret_unset_command/1`
+(used by both `local_launch_command/1` and `remote_launch_command/2`, so the remote SSH path — which has
+no `env:` option and relies solely on the `unset` command — is covered too). The existing tracker-secret
+stripping is unchanged; the foreign-credential name is deduplicated against it (`Enum.uniq/1`) before
+being joined into the `unset` command, so no malformed or redundant command is ever emitted. This is a
+targeted deny-list addition, not a conversion of Codex to an allow-list model — Codex's broader behavior
+(FR-006) is otherwise unmodified, and stripping `ANTHROPIC_API_KEY` has no functional effect on Codex
+itself since Codex/OpenAI never reads that variable.
+
+**Evidence**: `elixir/lib/symphony_elixir/codex/app_server.ex` (`@foreign_agent_credential_env_names`,
+`stripped_env_names/1`, `tracker_secret_port_env/1`, `tracker_secret_unset_command/1`). New regression
+test `elixir/test/symphony_elixir/agent_runner_dispatch_test.exs` — "a codex-backed run excludes
+ANTHROPIC_API_KEY and other unrelated env from the subprocess" — launches a real fake-`codex` subprocess
+that dumps its own environment to a file before responding to the JSON-RPC handshake, with a sentinel
+`ANTHROPIC_API_KEY` set in the parent environment; the dumped subprocess environment is asserted to
+contain neither the variable name nor its value, while an unrelated operator variable
+(`SYMPHONY_TEST_UNRELATED_VAR`) is asserted to still be present (proving the fix does not over-strip
+ordinary environment). This test fails against the pre-repair code (the dumped environment contains the
+sentinel `ANTHROPIC_API_KEY` value) and passes after the repair.
+
+**Scope note**: this repair addresses only environment-variable credentials. File-based credentials
+(e.g. anything either CLI might read from under `$HOME`, such as an OAuth token or keychain-backed
+config) are out of scope for this correction and are not claimed to be addressed by it.
