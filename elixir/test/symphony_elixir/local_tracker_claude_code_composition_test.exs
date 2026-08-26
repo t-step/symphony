@@ -13,6 +13,13 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   It exercises the real `AgentRunner.run/3` dispatch boundary, the real `Local.Adapter`/`Local.Store`,
   and the real `ClaudeCode.AppServer`/`MCPServer` wiring — only the `claude` executable itself is a
   fixture.
+
+  Also covers T032 (quickstart.md Scenario 2 step 6; research.md R6a): the fake-`claude` fixture
+  itself (not the test process) reads the `--mcp-config` file Symphony generated for the run,
+  extracts the real ephemeral `symphony_tracker` MCP URL from it, and issues a real HTTP
+  `tools/call` for `local_tracker_set_state` against that URL — the same structural path the real
+  `claude` CLI's MCP client would take. Mutation is verified by reading
+  `.symphony/local_tracker.json` directly off disk, never by trusting the run's reported success.
   """
 
   use SymphonyElixir.TestSupport
@@ -73,6 +80,41 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
            "did not expect a turn_failed event: #{inspect(lifecycle_events)}"
   end
 
+  test "an MCP local_tracker_set_state tool call issued by the fake-claude fixture lands on the exact bound issue record",
+       %{data_path: data_path, workspace_root: workspace_root, fake_claude: fake_claude} do
+    write_fake_claude_mcp_tool_call!(fake_claude)
+
+    assert {:ok, :initialized} = LocalInit.run(data_path)
+    seed_dispatchable_issue!(data_path)
+
+    write_local_claude_workflow!(Workflow.workflow_file_path(), data_path, workspace_root, fake_claude)
+    restart_workflow_store!()
+
+    assert {:ok, [%Issue{state: "todo"} = issue]} = Tracker.fetch_issues_by_ids([@issue_id])
+
+    assert :ok = AgentRunner.run(issue, self(), max_turns: 1)
+
+    lifecycle_events = drain_lifecycle_events(@issue_id)
+
+    assert Enum.any?(lifecycle_events, &(&1.event == :turn_completed)),
+           "expected the run to reach a terminal turn_completed lifecycle event, got: #{inspect(lifecycle_events)}"
+
+    # Independent proof of mutation: read the on-disk store directly, not through
+    # `Local.Adapter`/`Local.Store` (the same code path the tool call itself used) and not by
+    # trusting the run's reported lifecycle events.
+    on_disk_record =
+      data_path
+      |> File.read!()
+      |> Jason.decode!()
+      |> get_in(["issues", @issue_id])
+
+    assert on_disk_record["state"] == "in_progress",
+           "expected the fake-claude fixture's real MCP tools/call to have mutated " <>
+             "#{@issue_id}'s on-disk state to in_progress, got record: #{inspect(on_disk_record)}"
+
+    assert on_disk_record["identifier"] == @issue_id
+  end
+
   defp seed_dispatchable_issue!(data_path) do
     File.write!(
       data_path,
@@ -123,6 +165,43 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     File.write!(path, """
     #!/bin/sh
     printf '%s\\n' '{"type":"system","subtype":"init","session_id":"composition-fixture"}'
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+    """)
+
+    File.chmod!(path, 0o755)
+  end
+
+  # Unlike `write_fake_claude_two_turn_success!/1`, this fixture actually plays the MCP client
+  # role a real `claude` process would: it locates its own `--mcp-config` argv value (the JSON
+  # file `ClaudeCode.AppServer.write_mcp_config/2` generated for this run), extracts the real
+  # ephemeral `symphony_tracker` server URL from it (never hardcoded — this is what proves the
+  # fixture is driven through the actual generated endpoint, not a stand-in), and POSTs a real
+  # JSON-RPC `tools/call` for `local_tracker_set_state` to it via `curl`. `--mcp-config` is always
+  # the last flag in `ClaudeCode.AppServer`'s argv, followed only by file path(s) (a repo
+  # `.mcp.json`, if any, then Symphony's own generated file last) — so the last argv element
+  # observed after `--mcp-config` is always Symphony's own config, the one this fixture needs.
+  defp write_fake_claude_mcp_tool_call!(path) do
+    File.write!(path, """
+    #!/bin/sh
+    printf '%s\\n' '{"type":"system","subtype":"init","session_id":"composition-fixture"}'
+
+    MCP_CONFIG_PATH=""
+    FOUND_FLAG=0
+    for arg in "$@"; do
+      if [ "$FOUND_FLAG" = "1" ]; then
+        MCP_CONFIG_PATH="$arg"
+      fi
+      if [ "$arg" = "--mcp-config" ]; then
+        FOUND_FLAG=1
+      fi
+    done
+
+    MCP_URL=$(sed -n 's/.*"url":"\\([^"]*\\)".*/\\1/p' "$MCP_CONFIG_PATH")
+
+    curl -s -o /dev/null -X POST "$MCP_URL" \\
+      -H 'Content-Type: application/json' \\
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"local_tracker_set_state","arguments":{"state":"in_progress"}}}'
+
     printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
     """)
 
