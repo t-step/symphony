@@ -115,7 +115,7 @@ description: "Task list for Local Work Tracking and Selectable Coding-Agent Exec
 ## Phase 6: Polish & Cross-Cutting Concerns
 
 - [x] T035 [P] Update `elixir/AGENTS.md` (Docs Update Policy) documenting `tracker.kind: local`, `symphony local-tracker init`, `agent_execution.kind`, and `claude_code.*` as new `WORKFLOW.md` surface
-- [ ] T036 Run `make all` (format check, `mix specs.check`, `credo --strict`, coverage at the existing 100% threshold, dialyzer) across the full tree including every new module and test, and fix any gate failure (depends on T001–T034)
+- [x] T036 Run `make all` (format check, `mix specs.check`, `credo --strict`, coverage at the existing 100% threshold, dialyzer) across the full tree including every new module and test, and fix any gate failure (depends on T001–T034)
 - [ ] T037 Execute `quickstart.md` Scenarios 1–3 front-to-back exactly as written and record results (depends on T036)
 
 ---
