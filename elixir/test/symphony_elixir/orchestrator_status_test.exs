@@ -1176,7 +1176,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     setup do
       dir = Path.join(System.tmp_dir!(), "symphony-orch-local-#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
-      data_path = Path.join(dir, "local_tracker.json")
+      data_path = Path.join(dir, "local_tracker.db")
 
       on_exit(fn ->
         File.chmod(data_path, 0o644)
@@ -1238,7 +1238,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
       end)
 
-      File.write!(data_path, "{not json")
+      File.write!(data_path, "not a sqlite database")
 
       send(pid, :run_poll_cycle)
       Process.sleep(50)
@@ -1248,7 +1248,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert %{"1" => ^running_entry} = state_after.running
     end
 
-    test "a non-map issue record after startup is skipped and retried the same way, without crashing the orchestrator or the running attempt (#0003)",
+    test "a row with unparseable JSON in a labels/blocked_by column after startup is skipped and retried the same way, without crashing the orchestrator or the running attempt (#0003)",
          %{data_path: data_path} do
       orchestrator_name = Module.concat(__MODULE__, :LocalNonMapRecordOrchestrator)
       {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -1262,7 +1262,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         |> Map.put(:claimed, MapSet.put(state.claimed, "1"))
       end)
 
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => "todo"}}))
+      corrupt_local_tracker_labels_column!(data_path, "1")
 
       log =
         capture_log([level: :debug], fn ->
@@ -1948,7 +1948,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   defp seed_local_issue(data_path, id, state) do
-    File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{id => %{"state" => state}}}))
+    seed_local_tracker_issues!(data_path, %{id => %{"state" => state}})
+  end
+
+  defp corrupt_local_tracker_labels_column!(data_path, id) do
+    {:ok, conn} = Exqlite.Basic.open(data_path)
+    {:ok, _rows, _cols} = Exqlite.Basic.exec(conn, "UPDATE work_items SET labels = ? WHERE id = ?", ["not json", id]) |> Exqlite.Basic.rows()
+    :ok = Exqlite.Basic.close(conn)
   end
 
   defp write_local_tracker_workflow!(path, data_path) do

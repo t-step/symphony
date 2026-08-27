@@ -7,8 +7,7 @@ defmodule SymphonyElixir.LocalInitTest do
   setup do
     dir = Path.join(System.tmp_dir!(), "symphony-local-init-test-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    data_path = Path.join(dir, ".symphony/local_tracker.json")
-    marker_path = Store.marker_path(data_path)
+    data_path = Path.join(dir, ".symphony/local_tracker.db")
 
     on_exit(fn ->
       File.chmod(dir, 0o755)
@@ -16,134 +15,97 @@ defmodule SymphonyElixir.LocalInitTest do
       File.rm_rf!(dir)
     end)
 
-    %{dir: dir, data_path: data_path, marker_path: marker_path}
-  end
-
-  defp read_established_at(marker_path) do
-    marker_path |> File.read!() |> Jason.decode!() |> Map.fetch!("established_at")
+    %{dir: dir, data_path: data_path}
   end
 
   describe "fresh initialization" do
-    test "creates the data file then the marker, both valid, under a not-yet-existing parent directory", %{data_path: data_path, marker_path: marker_path} do
+    test "creates the database under a not-yet-existing parent directory, with a valid, empty schema", %{
+      data_path: data_path
+    } do
       refute File.exists?(Path.dirname(data_path))
 
       assert {:ok, :initialized} = Init.run(data_path)
 
-      assert %{"format_version" => 1, "issues" => %{}} = data_path |> File.read!() |> Jason.decode!()
-      assert %{"established_at" => established_at} = marker_path |> File.read!() |> Jason.decode!()
-      assert is_binary(established_at)
+      assert File.regular?(data_path)
+      assert {:ok, %{issues: %{}}} = Store.evaluate(data_path)
     end
   end
 
   describe "already-established store" do
-    test "refuses without --reset and leaves both files untouched (idempotent no-op re-run)", %{data_path: data_path, marker_path: marker_path} do
+    test "refuses without --reset and leaves the database untouched (idempotent no-op re-run)", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
-
-      original_data = File.read!(data_path)
-      original_marker = File.read!(marker_path)
+      original = File.read!(data_path)
 
       assert {:error, :already_established} = Init.run(data_path)
-      assert File.read!(data_path) == original_data
-      assert File.read!(marker_path) == original_marker
+      assert File.read!(data_path) == original
     end
 
-    test "refuses without --reset when the marker is present but the data file is missing (FR-013 loss)", %{data_path: data_path, marker_path: marker_path} do
-      File.mkdir_p!(Path.dirname(marker_path))
-      File.write!(marker_path, Jason.encode!(%{"established_at" => "2026-01-01T00:00:00Z"}))
+    test "refuses without --reset even when the established database is corrupt", %{data_path: data_path} do
+      assert {:ok, :initialized} = Init.run(data_path)
+      File.write!(data_path, "not a sqlite database")
+
+      assert {:error, :already_established} = Init.run(data_path)
+      assert File.read!(data_path) == "not a sqlite database"
+    end
+
+    test "refuses without --reset when a database file exists but was never marked established (FR-013's inconsistent-state case)",
+         %{data_path: data_path} do
+      File.mkdir_p!(Path.dirname(data_path))
+      File.write!(data_path, "not a sqlite database")
+
+      assert {:error, {:ambiguous_local_tracker_state, :marker_missing}} = Init.run(data_path)
+      assert File.read!(data_path) == "not a sqlite database"
+    end
+
+    test "refuses without --reset when the marker is present but the database file is missing (FR-013 established-state loss)",
+         %{data_path: data_path} do
+      assert {:ok, :initialized} = Init.run(data_path)
+      File.rm!(data_path)
 
       assert {:error, :already_established} = Init.run(data_path)
       refute File.exists?(data_path)
-    end
-
-    test "refuses without --reset when the marker exists but is unreadable (a directory, not a file)", %{data_path: data_path, marker_path: marker_path} do
-      File.mkdir_p!(marker_path)
-
-      assert {:error, {:marker_unreadable, _reason}} = Init.run(data_path)
-      refute File.exists?(data_path)
-    end
-  end
-
-  describe "ambiguous state (data present, marker missing) — the sanctioned recovery path" do
-    test "completes establishment by writing only the marker; the data file is byte-for-byte unchanged", %{data_path: data_path, marker_path: marker_path} do
-      File.mkdir_p!(Path.dirname(data_path))
-      original_content = Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => %{"state" => "todo"}}})
-      File.write!(data_path, original_content)
-      refute File.exists?(marker_path)
-
-      assert {:ok, :marker_completed} = Init.run(data_path)
-
-      assert File.read!(data_path) == original_content
-      assert {"established_at", established_at} = {"established_at", read_established_at(marker_path)}
-      assert is_binary(established_at)
-    end
-
-    test "re-running init again after completion refuses (now genuinely established)", %{data_path: data_path} do
-      File.mkdir_p!(Path.dirname(data_path))
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{}}))
-
-      assert {:ok, :marker_completed} = Init.run(data_path)
-      assert {:error, :already_established} = Init.run(data_path)
-    end
-
-    test "refuses with a clear error when the data file is present but does not parse, and creates no marker", %{data_path: data_path, marker_path: marker_path} do
-      File.mkdir_p!(Path.dirname(data_path))
-      File.write!(data_path, "not valid json")
-
-      assert {:error, {:unparseable_data_file, _reason}} = Init.run(data_path)
-      refute File.exists?(marker_path)
-      assert File.read!(data_path) == "not valid json"
-    end
-
-    test "surfaces a write failure when completing establishment fails (unwritable parent directory)", %{data_path: data_path, marker_path: marker_path} do
-      parent = Path.dirname(data_path)
-      File.mkdir_p!(parent)
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{}}))
-      File.chmod!(parent, 0o500)
-
-      assert {:error, _reason} = Init.run(data_path)
-
-      File.chmod!(parent, 0o755)
-      refute File.exists?(marker_path)
     end
   end
 
   describe "--reset" do
-    test "deletes both files (if present) and recreates a fresh, valid pair", %{data_path: data_path, marker_path: marker_path} do
+    test "deletes the existing database (if present) and recreates a fresh, valid one", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
 
       {:ok, store} = Store.start_link(path: data_path)
       assert {:error, :issue_not_found} = Store.set_issue_state(store, "1", "todo")
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => %{"state" => "todo"}}}))
+      GenServer.stop(store)
+
+      {:ok, conn} = Exqlite.Basic.open(data_path)
+      {:ok, _rows, _cols} = Exqlite.Basic.exec(conn, "INSERT INTO work_items (id, state) VALUES ('1', 'todo')") |> Exqlite.Basic.rows()
+      :ok = Exqlite.Basic.close(conn)
 
       assert {:ok, :reset} = Init.run(data_path, reset: true)
 
-      assert %{"format_version" => 1, "issues" => %{}} = data_path |> File.read!() |> Jason.decode!()
-      assert File.exists?(marker_path)
+      assert {:ok, %{issues: %{}}} = Store.evaluate(data_path)
     end
 
-    test "works even when neither file previously existed", %{data_path: data_path, marker_path: marker_path} do
+    test "works even when nothing previously existed", %{data_path: data_path} do
       refute File.exists?(data_path)
 
       assert {:ok, :reset} = Init.run(data_path, reset: true)
 
-      assert File.exists?(data_path)
-      assert File.exists?(marker_path)
+      assert {:ok, %{issues: %{}}} = Store.evaluate(data_path)
     end
 
-    test "works when the store was only ambiguous (data present, marker missing)", %{data_path: data_path, marker_path: marker_path} do
+    test "works when the existing file was not a valid SQLite database", %{data_path: data_path} do
       File.mkdir_p!(Path.dirname(data_path))
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"stale" => %{"state" => "todo"}}}))
+      File.write!(data_path, "not a sqlite database")
 
       assert {:ok, :reset} = Init.run(data_path, reset: true)
 
-      assert %{"format_version" => 1, "issues" => %{}} = data_path |> File.read!() |> Jason.decode!()
-      assert File.exists?(marker_path)
+      assert {:ok, %{issues: %{}}} = Store.evaluate(data_path)
     end
 
-    test "surfaces a delete failure (unwritable parent directory) and leaves the established store intact", %{data_path: data_path, marker_path: marker_path} do
+    test "surfaces a delete failure (unwritable parent directory) and leaves the established store intact", %{
+      data_path: data_path
+    } do
       assert {:ok, :initialized} = Init.run(data_path)
-      original_data = File.read!(data_path)
-      original_marker = File.read!(marker_path)
+      original = File.read!(data_path)
 
       parent = Path.dirname(data_path)
       File.chmod!(parent, 0o500)
@@ -151,12 +113,11 @@ defmodule SymphonyElixir.LocalInitTest do
       assert {:error, _reason} = Init.run(data_path, reset: true)
 
       File.chmod!(parent, 0o755)
-      assert File.read!(data_path) == original_data
-      assert File.read!(marker_path) == original_marker
+      assert File.read!(data_path) == original
     end
   end
 
-  describe "atomic-write / failure behavior" do
+  describe "write-failure behavior" do
     test "a write failure (unwritable parent directory) leaves no partial state behind", %{data_path: data_path} do
       parent = Path.dirname(data_path)
       File.mkdir_p!(parent)
@@ -166,10 +127,24 @@ defmodule SymphonyElixir.LocalInitTest do
 
       File.chmod!(parent, 0o755)
       refute File.exists?(data_path)
+      refute File.exists?(Store.marker_path(data_path))
+    end
+
+    test "a failure to even create the parent directory tree leaves no partial state behind", %{dir: dir} do
+      grandparent = Path.join(dir, "grandparent")
+      File.mkdir_p!(grandparent)
+      File.chmod!(grandparent, 0o500)
+
+      data_path = Path.join(grandparent, "not-yet-created/local_tracker.db")
+
+      assert {:error, _reason} = Init.run(data_path)
+
+      File.chmod!(grandparent, 0o755)
+      refute File.exists?(Path.dirname(data_path))
     end
 
     test "resolves a relative path the same way as an absolute one", %{dir: dir} do
-      data_path = Path.join(dir, "relative/local_tracker.json")
+      data_path = Path.join(dir, "relative/local_tracker.db")
       assert {:ok, :initialized} = Init.run(data_path)
       assert File.exists?(data_path)
     end

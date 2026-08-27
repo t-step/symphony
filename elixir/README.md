@@ -289,34 +289,44 @@ codex:
 
 ### Local tracker
 
-Use `tracker.kind: local` to track work in a local JSON file instead of a hosted tracker — no
-tracker account, API token, or network access required.
+Use `tracker.kind: local` to track work in a local SQLite database instead of a hosted tracker —
+no tracker account, API token, or network access required. SQLite is the durable source of truth:
+there is no JSON export, sidecar cache, or Git-based state to keep in sync.
 
-- Config: `tracker.provider.path` (default `.symphony/local_tracker.json`, resolved relative to
-  the directory containing `WORKFLOW.md`) is the data file location. Like `tracker.kind` itself,
-  `tracker.provider.path` is **structural** under `tracker.kind: local`: it is read once at
+- Config: `tracker.provider.path` (default `.symphony/local_tracker.db`, resolved relative to
+  the directory containing `WORKFLOW.md`) is the database file location. Like `tracker.kind`
+  itself, `tracker.provider.path` is **structural** under `tracker.kind: local`: it is read once at
   startup, and editing it while Symphony is running only takes effect after a restart. This is
   narrower than every other adapter's `tracker.provider.*`, which stays live-reloadable, because
   changing this path mid-run would silently swap in a different dataset rather than just changing
   how to reach the same one.
-- Initialization: Symphony never creates the data file or its establishment marker
-  (`<path>.established`) implicitly. Before starting Symphony against a given path, run:
+- Storage model: the database has one table, `work_items` (id, identifier, title, description,
+  priority, state, branch_name, url, assignee_id, labels, blocked_by, dispatchable, created_at,
+  updated_at), and one view, `work_item_projection`, selecting exactly those columns — the boundary
+  Symphony's read path (`Local.Adapter`/`Local.Store`) queries against. `dispatchable` is a stored
+  admission fact per row (`true` by default), not something Symphony computes; there is no
+  milestone/dependency-graph model here — Symphony only consumes the small, flat projection.
+- Initialization: Symphony never creates the database or its establishment marker
+  (`<path>.established` — a small sentinel file carrying no work-item data, kept only so a
+  previously-established store's loss can be distinguished from a store that was never set up)
+  implicitly. Before starting Symphony against a given path, run:
 
   ```bash
   ./bin/symphony local-tracker init [--reset] [path-to-WORKFLOW.md]
   ```
 
   This resolves `tracker.provider.path` from the given `WORKFLOW.md` (default `./WORKFLOW.md`) and
-  atomically creates the data file and marker; it does not start the orchestrator. Re-running
-  `init` against an already-established store refuses unless `--reset` is passed. `--reset` deletes
-  and recreates both files. If the data file exists and parses but the marker is missing, `init`
-  completes establishment by writing only the marker, leaving the data untouched. Startup (and
-  every dispatch tick) fails clearly with `local_tracker_not_initialized` or
-  `local_tracker_ambiguous_state` if the store hasn't been established yet at the configured path.
+  creates the database (`work_items` table, `work_item_projection` view) then the marker; it does
+  not start the orchestrator. Re-running `init` against an already-established store refuses unless
+  `--reset` is passed, and also refuses if a database file exists at the path without ever having
+  been marked established (an inconsistent state `--reset` clears). `--reset` deletes and recreates
+  both. Startup (and every dispatch tick) fails clearly with `local_tracker_not_initialized` if the
+  store hasn't been established yet, or with `local_tracker_corrupt` if previously-established state
+  has since gone missing, become unreadable, or a row's stored JSON (labels/blocked_by) fails to
+  decode — Symphony never silently recreates or resets an established store on its own.
 - States: default `active_states` are `todo`, `in_progress`, `blocked`; default `terminal_states`
   are `done`, `cancelled` — override with `tracker.active_states`/`tracker.terminal_states` exactly
-  like any other adapter. Every issue this adapter returns is `dispatchable: true`; there is no
-  archived/withdrawn concept.
+  like any other adapter.
 - Tool: advertises `local_tracker_set_state` (input: `{"state": "<new state>"}`), scoped to the
   current session's bound issue only — it cannot target an arbitrary issue ID. Setting the same
   value again is a no-op success.
@@ -382,7 +392,7 @@ Minimal example combining the local tracker with Claude Code execution:
 tracker:
   kind: local
   provider:
-    path: .symphony/local_tracker.json
+    path: .symphony/local_tracker.db
 workspace:
   root: ~/code/workspaces
 agent_execution:

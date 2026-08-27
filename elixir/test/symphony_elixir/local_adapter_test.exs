@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Local.AdapterTest do
   setup do
     dir = Path.join(System.tmp_dir!(), "symphony-local-adapter-test-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    data_path = Path.join(dir, "local_tracker.json")
+    data_path = Path.join(dir, "local_tracker.db")
 
     on_exit(fn -> File.rm_rf(dir) end)
 
@@ -16,18 +16,11 @@ defmodule SymphonyElixir.Local.AdapterTest do
   end
 
   describe "validate_config/1 (startup/config-validation coverage)" do
-    test "both files absent surfaces local_tracker_not_initialized", %{data_path: data_path} do
+    test "an absent database surfaces local_tracker_not_initialized", %{data_path: data_path} do
       assert {:error, :local_tracker_not_initialized} = LocalAdapter.validate_config(tracker_settings(data_path))
     end
 
-    test "data present without a marker surfaces local_tracker_ambiguous_state", %{data_path: data_path} do
-      seed_issues(data_path, %{})
-
-      assert {:error, {:local_tracker_ambiguous_state, :marker_missing}} =
-               LocalAdapter.validate_config(tracker_settings(data_path))
-    end
-
-    test "established-then-lost data surfaces local_tracker_corrupt", %{data_path: data_path} do
+    test "established-then-lost data surfaces local_tracker_corrupt, not a fresh empty store (FR-013)", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
       File.rm!(data_path)
 
@@ -37,10 +30,9 @@ defmodule SymphonyElixir.Local.AdapterTest do
 
     test "established-but-unparseable data surfaces local_tracker_corrupt", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
-      File.write!(data_path, "{not json")
+      File.write!(data_path, "not a sqlite database")
 
-      assert {:error, {:local_tracker_corrupt, {:invalid_json, _message}}} =
-               LocalAdapter.validate_config(tracker_settings(data_path))
+      assert {:error, {:local_tracker_corrupt, _reason}} = LocalAdapter.validate_config(tracker_settings(data_path))
     end
 
     test "a valid established store validates normally", %{data_path: data_path} do
@@ -62,7 +54,7 @@ defmodule SymphonyElixir.Local.AdapterTest do
   end
 
   describe "normal operation" do
-    test "reads normalize records 1:1, filter by state, dispatchable is always true, no secrets", %{data_path: data_path} do
+    test "reads normalize records 1:1, filter by state, dispatchable is a stored fact, no secrets", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
 
       seed_issues(data_path, %{
@@ -112,6 +104,23 @@ defmodule SymphonyElixir.Local.AdapterTest do
       assert [%{"name" => "local_tracker_set_state"}] = LocalAdapter.agent_tool_specs()
     end
 
+    test "dispatchable is an admission fact carried through from the store, not computed", %{data_path: data_path} do
+      assert {:ok, :initialized} = Init.run(data_path)
+
+      seed_issues(data_path, %{
+        "1" => %{"state" => "todo", "dispatchable" => false},
+        "2" => %{"state" => "todo", "dispatchable" => true}
+      })
+
+      start_singleton!(data_path)
+
+      assert {:ok, issues} = LocalAdapter.fetch_issues_by_states(["todo"])
+      by_id = Map.new(issues, &{&1.id, &1.dispatchable})
+
+      assert by_id["1"] == false
+      assert by_id["2"] == true
+    end
+
     test "a record missing optional fields still maps cleanly with safe defaults", %{data_path: data_path} do
       assert {:ok, :initialized} = Init.run(data_path)
       seed_issues(data_path, %{"1" => %{"state" => "todo"}})
@@ -147,16 +156,19 @@ defmodule SymphonyElixir.Local.AdapterTest do
       refute Enum.any?(elem(LocalAdapter.fetch_issues_by_states(["todo"]), 1), &(&1.id == "1"))
     end
 
-    test "a non-map issue record surfaces as a structured tracker error instead of raising", %{data_path: data_path} do
+    test "a row with unparseable JSON in a labels/blocked_by column surfaces as a structured tracker error instead of raising", %{
+      data_path: data_path
+    } do
       assert {:ok, :initialized} = Init.run(data_path)
-      seed_issues(data_path, %{"1" => "todo", "2" => %{"state" => "todo"}})
+      seed_issues(data_path, %{"1" => %{"state" => "todo"}, "2" => %{"state" => "todo"}})
+      corrupt_labels_column!(data_path, "1")
       start_singleton!(data_path)
 
-      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
+      assert {:error, {:local_tracker_corrupt, {:invalid_column_json, "1", "labels", _message}}} =
                LocalAdapter.fetch_issues_by_states(["todo"])
 
-      assert {:error, {:local_tracker_corrupt, {:invalid_shape, {:non_map_issue_record, "1", "todo"}}}} =
-               LocalAdapter.fetch_issues_by_ids(["2"])
+      assert {:error, {:local_tracker_corrupt, {:invalid_column_json, "1", "labels", _message}}} =
+               LocalAdapter.fetch_issues_by_ids(["1"])
     end
   end
 
@@ -178,13 +190,13 @@ defmodule SymphonyElixir.Local.AdapterTest do
       assert {:ok, [%{id: "1", state: "in_progress"}]} = LocalAdapter.fetch_issues_by_ids(["1"])
       assert {:ok, [%{id: "2", state: "todo"}]} = LocalAdapter.fetch_issues_by_ids(["2"])
 
-      before = File.read!(data_path)
+      before = LocalAdapter.fetch_issues_by_ids(["1"])
 
       idempotent =
         LocalAdapter.execute_agent_tool("local_tracker_set_state", %{"state" => "in_progress"}, issue: bound_issue)
 
       assert idempotent["success"] == true
-      assert File.read!(data_path) == before
+      assert LocalAdapter.fetch_issues_by_ids(["1"]) == before
 
       cannot_target_unbound_record =
         LocalAdapter.execute_agent_tool("local_tracker_set_state", %{"state" => "done"}, issue: %Issue{id: "does-not-exist"})
@@ -279,8 +291,12 @@ defmodule SymphonyElixir.Local.AdapterTest do
     }
   end
 
-  defp seed_issues(data_path, issues) do
-    File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => issues}))
+  defp seed_issues(data_path, issues), do: seed_local_tracker_issues!(data_path, issues)
+
+  defp corrupt_labels_column!(data_path, id) do
+    {:ok, conn} = Exqlite.Basic.open(data_path)
+    {:ok, _rows, _cols} = Exqlite.Basic.exec(conn, "UPDATE work_items SET labels = ? WHERE id = ?", ["not json", id]) |> Exqlite.Basic.rows()
+    :ok = Exqlite.Basic.close(conn)
   end
 
   defp start_singleton!(data_path) do

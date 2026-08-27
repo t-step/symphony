@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
-  @local_default_provider_path ".symphony/local_tracker.json"
+  @local_default_provider_path ".symphony/local_tracker.db"
   @local_active_states ["todo", "in_progress", "blocked"]
   @local_terminal_states ["done", "cancelled"]
 

@@ -1,12 +1,14 @@
 defmodule SymphonyElixir.Local.Adapter do
   @moduledoc """
-  Local, file-backed tracker adapter (`tracker.kind: local`).
+  Local, SQLite-backed tracker adapter (`tracker.kind: local`).
 
-  Every read delegates to `SymphonyElixir.Local.Store` — this module never touches the filesystem
-  directly. Records are mapped 1:1 onto `Tracker.Issue.t()`; `dispatchable` is always `true`
-  (research.md R11, matching the `gitlab/client.ex` precedent). `validate_config/1` distinguishes
-  not-initialized, ambiguous, and corrupt/established-loss states (surfaced by `Local.Store`) from a
-  structurally invalid `tracker.provider.path`, and never creates lifecycle state itself.
+  Every read delegates to `SymphonyElixir.Local.Store` — this module never touches the database
+  directly. Records are mapped 1:1 onto `Tracker.Issue.t()` from `Local.Store`'s
+  `work_item_projection` read; `dispatchable` is a stored admission fact on each row (default
+  `true` on establishment), not something this adapter computes — Symphony carries it through
+  unchanged rather than deriving eligibility from milestone/dependency semantics it doesn't own.
+  `validate_config/1` distinguishes not-initialized and corrupt states (surfaced by `Local.Store`)
+  from a structurally invalid `tracker.provider.path`, and never creates lifecycle state itself.
   """
 
   @behaviour SymphonyElixir.Tracker
@@ -15,7 +17,7 @@ defmodule SymphonyElixir.Local.Adapter do
   alias SymphonyElixir.Local.{AgentTool, Store}
   alias SymphonyElixir.Tracker.Issue
 
-  @default_provider_path ".symphony/local_tracker.json"
+  @default_provider_path ".symphony/local_tracker.db"
 
   @doc """
   Resolves `tracker.provider.path` against `workflow_dir` — the same rule `workspace.root` already
@@ -77,7 +79,7 @@ defmodule SymphonyElixir.Local.Adapter do
     %Issue{
       id: id,
       native_ref: nil,
-      identifier: Map.get(record, "identifier", id),
+      identifier: Map.get(record, "identifier") || id,
       title: Map.get(record, "title"),
       description: Map.get(record, "description"),
       priority: Map.get(record, "priority"),
@@ -85,16 +87,13 @@ defmodule SymphonyElixir.Local.Adapter do
       branch_name: Map.get(record, "branch_name"),
       url: Map.get(record, "url"),
       assignee_id: Map.get(record, "assignee_id"),
-      labels: normalize_list(Map.get(record, "labels")),
-      blocked_by: normalize_list(Map.get(record, "blocked_by")),
-      dispatchable: true,
+      labels: Map.get(record, "labels", []),
+      blocked_by: Map.get(record, "blocked_by", []),
+      dispatchable: Map.get(record, "dispatchable", true),
       created_at: parse_datetime(Map.get(record, "created_at")),
       updated_at: parse_datetime(Map.get(record, "updated_at"))
     }
   end
-
-  defp normalize_list(value) when is_list(value), do: value
-  defp normalize_list(_value), do: []
 
   defp parse_datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do

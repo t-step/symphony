@@ -143,15 +143,14 @@ defmodule SymphonyElixir.CLI do
   end
 
   defp format_local_tracker_outcome(:initialized), do: "initialized"
-  defp format_local_tracker_outcome(:marker_completed), do: "establishment completed"
   defp format_local_tracker_outcome(:reset), do: "reset and reinitialized"
 
   defp format_local_tracker_error(:already_established) do
     "already established; pass --reset to overwrite"
   end
 
-  defp format_local_tracker_error({:unparseable_data_file, reason}) do
-    "existing data file does not parse as valid JSON (#{inspect(reason)}); resolve manually or pass --reset"
+  defp format_local_tracker_error({:local_tracker_corrupt, reason}) do
+    "existing database does not open cleanly (#{inspect(reason)}); resolve manually or pass --reset"
   end
 
   defp format_local_tracker_error(reason), do: inspect(reason)

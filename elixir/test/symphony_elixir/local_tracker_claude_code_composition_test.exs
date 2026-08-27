@@ -18,8 +18,9 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   itself (not the test process) reads the `--mcp-config` file Symphony generated for the run,
   extracts the real ephemeral `symphony_tracker` MCP URL from it, and issues a real HTTP
   `tools/call` for `local_tracker_set_state` against that URL — the same structural path the real
-  `claude` CLI's MCP client would take. Mutation is verified by reading
-  `.symphony/local_tracker.json` directly off disk, never by trusting the run's reported success.
+  `claude` CLI's MCP client would take. Mutation is verified by reading the local tracker's SQLite
+  database directly (`read_local_tracker_issue!/2`, bypassing `Local.Adapter`/`Local.Store`), never
+  by trusting the run's reported success.
 
   Also covers T033 (quickstart.md Scenario 2 step 7; research.md R6a's per-run isolation): two
   concurrent `claude_code`-backed runs, driven by real `AgentRunner.run/3` dispatches against two
@@ -47,7 +48,7 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     test_root =
       Path.join(System.tmp_dir!(), "symphony-local-claude-composition-test-#{System.unique_integer([:positive])}")
 
-    data_path = Path.join(test_root, "local_tracker.json")
+    data_path = Path.join(test_root, "local_tracker.db")
     workspace_root = Path.join(test_root, "workspaces")
     fake_claude = Path.join(test_root, "fake-claude")
 
@@ -114,14 +115,10 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
     assert Enum.any?(lifecycle_events, &(&1.event == :turn_completed)),
            "expected the run to reach a terminal turn_completed lifecycle event, got: #{inspect(lifecycle_events)}"
 
-    # Independent proof of mutation: read the on-disk store directly, not through
+    # Independent proof of mutation: read the on-disk SQLite store directly, not through
     # `Local.Adapter`/`Local.Store` (the same code path the tool call itself used) and not by
     # trusting the run's reported lifecycle events.
-    on_disk_record =
-      data_path
-      |> File.read!()
-      |> Jason.decode!()
-      |> get_in(["issues", @issue_id])
+    on_disk_record = read_local_tracker_issue!(data_path, @issue_id)
 
     assert on_disk_record["state"] == "in_progress",
            "expected the fake-claude fixture's real MCP tools/call to have mutated " <>
@@ -193,14 +190,8 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
              "expected #{issue_id}'s run to reach a terminal turn_completed lifecycle event, got: #{inspect(lifecycle_events)}"
     end
 
-    on_disk_issues =
-      data_path
-      |> File.read!()
-      |> Jason.decode!()
-      |> Map.fetch!("issues")
-
-    record_a = Map.fetch!(on_disk_issues, @issue_id_a)
-    record_b = Map.fetch!(on_disk_issues, @issue_id_b)
+    record_a = read_local_tracker_issue!(data_path, @issue_id_a)
+    record_b = read_local_tracker_issue!(data_path, @issue_id_b)
 
     # Each issue received only its own run's mutation -- no cross-binding occurred.
     assert record_a["state"] == "in_progress-#{@issue_id_a}"
@@ -303,19 +294,9 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   end
 
   defp seed_dispatchable_issue!(data_path) do
-    File.write!(
-      data_path,
-      Jason.encode!(%{
-        "format_version" => 1,
-        "issues" => %{
-          @issue_id => %{
-            "state" => "todo",
-            "identifier" => @issue_id,
-            "title" => "Local tracker + Claude Code composition"
-          }
-        }
-      })
-    )
+    seed_local_tracker_issues!(data_path, %{
+      @issue_id => %{"state" => "todo", "identifier" => @issue_id, "title" => "Local tracker + Claude Code composition"}
+    })
   end
 
   defp write_local_claude_workflow!(path, data_path, workspace_root, fake_claude, opts \\ []) do
@@ -352,16 +333,10 @@ defmodule SymphonyElixir.LocalTrackerClaudeCodeCompositionTest do
   end
 
   defp seed_two_dispatchable_issues!(data_path, id_a, id_b) do
-    File.write!(
-      data_path,
-      Jason.encode!(%{
-        "format_version" => 1,
-        "issues" => %{
-          id_a => %{"state" => "todo", "identifier" => id_a, "title" => "Concurrent isolation A"},
-          id_b => %{"state" => "todo", "identifier" => id_b, "title" => "Concurrent isolation B"}
-        }
-      })
-    )
+    seed_local_tracker_issues!(data_path, %{
+      id_a => %{"state" => "todo", "identifier" => id_a, "title" => "Concurrent isolation A"},
+      id_b => %{"state" => "todo", "identifier" => id_b, "title" => "Concurrent isolation B"}
+    })
   end
 
   defp write_fake_claude_two_turn_success!(path) do

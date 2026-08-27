@@ -30,7 +30,7 @@ defmodule SymphonyElixir.ClaudeCodeLiveE2ETest do
     test_root = Path.join(System.tmp_dir!(), run_id)
     workflow_root = Path.join(test_root, "workflow")
     workflow_file = Path.join(workflow_root, "WORKFLOW.md")
-    data_path = Path.join(test_root, "local_tracker.json")
+    data_path = Path.join(test_root, "local_tracker.db")
     original_workflow_path = Workflow.workflow_file_path()
 
     File.mkdir_p!(workflow_root)
@@ -120,19 +120,9 @@ defmodule SymphonyElixir.ClaudeCodeLiveE2ETest do
   end
 
   defp seed_dispatchable_issue!(data_path) do
-    File.write!(
-      data_path,
-      Jason.encode!(%{
-        "format_version" => 1,
-        "issues" => %{
-          @issue_id => %{
-            "state" => "todo",
-            "identifier" => @issue_id,
-            "title" => "Symphony Claude Code live e2e"
-          }
-        }
-      })
-    )
+    seed_local_tracker_issues!(data_path, %{
+      @issue_id => %{"state" => "todo", "identifier" => @issue_id, "title" => "Symphony Claude Code live e2e"}
+    })
   end
 
   defp write_local_claude_workflow!(path, data_path, test_root) do

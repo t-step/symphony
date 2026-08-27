@@ -106,14 +106,14 @@ defmodule SymphonyElixir.ConfigStructuralSnapshotTest do
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf(dir) end)
 
-      store_a = Path.join(dir, "store_a.json")
-      store_b = Path.join(dir, "store_b.json")
+      store_a = Path.join(dir, "store_a.db")
+      store_b = Path.join(dir, "store_b.db")
 
       assert {:ok, :initialized} = LocalInit.run(store_a)
-      File.write!(store_a, Jason.encode!(%{"format_version" => 1, "issues" => %{"a" => %{"state" => "todo"}}}))
+      seed_local_tracker_issues!(store_a, %{"a" => %{"state" => "todo"}})
 
       assert {:ok, :initialized} = LocalInit.run(store_b)
-      File.write!(store_b, Jason.encode!(%{"format_version" => 1, "issues" => %{"b" => %{"state" => "todo"}}}))
+      seed_local_tracker_issues!(store_b, %{"b" => %{"state" => "todo"}})
 
       %{store_a: store_a, store_b: store_b}
     end

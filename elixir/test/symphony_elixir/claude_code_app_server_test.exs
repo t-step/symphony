@@ -115,9 +115,9 @@ defmodule SymphonyElixir.ClaudeCode.AppServerTest do
   describe "start_session/2 MCP wiring" do
     test "starts one MCP listener, writes a --mcp-config file pointing at it, and exposes the bound tracker's tools",
          %{workspace: workspace, issue: issue, test_root: test_root} do
-      data_path = Path.join(test_root, "local_tracker.json")
+      data_path = Path.join(test_root, "local_tracker.db")
       assert {:ok, :initialized} = Init.run(data_path)
-      File.write!(data_path, Jason.encode!(%{"format_version" => 1, "issues" => %{"1" => %{"state" => "todo"}}}))
+      seed_local_tracker_issues!(data_path, %{"1" => %{"state" => "todo"}})
 
       write_local_workflow!(Workflow.workflow_file_path(), data_path, Path.dirname(workspace))
       restart_workflow_store!()

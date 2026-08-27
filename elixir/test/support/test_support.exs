@@ -27,7 +27,9 @@ defmodule SymphonyElixir.TestSupport do
           write_workflow_file!: 2,
           restore_env: 2,
           stop_default_http_server: 0,
-          restart_workflow_store!: 0
+          restart_workflow_store!: 0,
+          seed_local_tracker_issues!: 2,
+          read_local_tracker_issue!: 2
         ]
 
       setup do
@@ -104,6 +106,72 @@ defmodule SymphonyElixir.TestSupport do
       nil ->
         :ok
     end
+  end
+
+  @doc """
+  Test-only direct seeding of the local tracker's SQLite store, bypassing `Local.Store`/
+  `Local.AgentTool` entirely — the out-of-band write path these tests use to set up fixture data,
+  mirroring how the JSON-file predecessor's tests wrote the data file directly. Replaces the full
+  contents of `work_items` with `issues` (a map of `id => attrs`, attrs using the same string keys
+  `Local.Adapter.to_issue/1` reads: `"identifier"`, `"title"`, `"description"`, `"priority"`,
+  `"state"`, `"branch_name"`, `"url"`, `"assignee_id"`, `"labels"`, `"blocked_by"`,
+  `"dispatchable"` (defaults `true`), `"created_at"`, `"updated_at"`). Requires the database to
+  already be established (`Local.Init.run/1` already called against `data_path`).
+  """
+  def seed_local_tracker_issues!(data_path, issues) do
+    {:ok, conn} = Exqlite.Basic.open(data_path)
+    {:ok, _rows, _cols} = Exqlite.Basic.exec(conn, "DELETE FROM work_items") |> Exqlite.Basic.rows()
+    Enum.each(issues, fn {id, attrs} -> insert_local_tracker_issue!(conn, id, attrs) end)
+    :ok = Exqlite.Basic.close(conn)
+    :ok
+  end
+
+  @doc """
+  Test-only direct read of one row from the local tracker's SQLite store, bypassing
+  `Local.Adapter`/`Local.Store` entirely — independent proof that a mutation (e.g. an MCP
+  `local_tracker_set_state` tool call) actually landed on disk, not merely that the run reported
+  success. Returns the raw row as a string-keyed map (`labels`/`blocked_by` JSON-decoded,
+  `dispatchable` as an integer) or `nil` if no such row exists.
+  """
+  def read_local_tracker_issue!(data_path, id) do
+    {:ok, conn} = Exqlite.Basic.open(data_path)
+
+    result =
+      case Exqlite.Basic.exec(conn, "SELECT * FROM work_items WHERE id = ?", [id]) |> Exqlite.Basic.rows() do
+        {:ok, [], _columns} -> nil
+        {:ok, [row], columns} -> columns |> Enum.map(&to_string/1) |> Enum.zip(row) |> Map.new()
+      end
+
+    :ok = Exqlite.Basic.close(conn)
+    result
+  end
+
+  defp insert_local_tracker_issue!(conn, id, attrs) do
+    sql = """
+    INSERT INTO work_items
+      (id, identifier, title, description, priority, state, branch_name, url, assignee_id,
+       labels, blocked_by, dispatchable, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    args = [
+      id,
+      Map.get(attrs, "identifier"),
+      Map.get(attrs, "title"),
+      Map.get(attrs, "description"),
+      Map.get(attrs, "priority"),
+      Map.get(attrs, "state"),
+      Map.get(attrs, "branch_name"),
+      Map.get(attrs, "url"),
+      Map.get(attrs, "assignee_id"),
+      Jason.encode!(Map.get(attrs, "labels", [])),
+      Jason.encode!(Map.get(attrs, "blocked_by", [])),
+      if(Map.get(attrs, "dispatchable", true), do: 1, else: 0),
+      Map.get(attrs, "created_at"),
+      Map.get(attrs, "updated_at")
+    ]
+
+    {:ok, _rows, _cols} = Exqlite.Basic.exec(conn, sql, args) |> Exqlite.Basic.rows()
   end
 
   def stop_default_http_server do
