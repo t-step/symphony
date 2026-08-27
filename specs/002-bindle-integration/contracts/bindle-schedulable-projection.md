@@ -1,9 +1,11 @@
 # Contract: Bindle-Facing Schedulable Projection (logical + physical contract)
 
 This documents the obligations the published projection artifact and the new acquisition/release seam must
-satisfy — the projection's *physical* shape (a separate SQLite file, specific columns) is now fixed by this
-specification (research.md R1, R9); Bindle's own publish mechanics (refresh cadence, atomic-rename
-implementation, where the publish job runs) remain an implementation decision. It exists so a future
+satisfy, plus the corrected invariant governing how Symphony may use the projection's `dispatchable` fact
+(Continuation obligations, below) — the projection's *physical* shape (a separate SQLite file, specific
+columns, opened read-only) is now fixed by this specification (research.md R1, R9); Bindle's own publish
+mechanics (refresh cadence, atomic-rename implementation, where the publish job runs) remain an
+implementation decision. It exists so a future
 implementation feature can be verified against a stable, pre-agreed contract rather than reverse-engineered
 from whatever Bindle happens to expose first. Follows the same adapter-profile-documentation spirit
 `SPEC.md` §11.2 requires of every concrete tracker adapter, one level up: this documents what the
@@ -66,6 +68,14 @@ contains them.
 - Bindle's own publish mechanics (refresh cadence, where the publish job runs, how atomicity is
   implemented) remain deferred to the eventual implementation feature — only the artifact's physical shape
   (separate file, read-only, schema-versioned) is fixed here.
+- **Symphony's adapter MUST open the published artifact using SQLite's own read-only open mode** (e.g. a
+  read-only connection/URI such as `mode=ro`). Physical separation from Bindle's canonical file structurally
+  prevents the adapter from ever reaching Bindle's canonical tables, but does not by itself make the artifact
+  read-only to Symphony's own process — nothing about a physically separate file stops a write statement
+  from being issued against it. Application-level read-only open semantics are therefore the enforced
+  requirement, not merely an adapter implementation that happens never to issue a write statement. Symphony's
+  adapter MUST NOT create, migrate, or repair this artifact file under any circumstance; Bindle alone owns
+  its publication and replacement.
 
 ## Field obligations (data-model.md §1)
 
@@ -106,6 +116,27 @@ Every record the projection does include MUST carry a precomputed `dispatchable`
 - Is a point-in-time snapshot as of the projection's last publish and MAY be stale by the time Symphony
   actually attempts to dispatch — this is exactly why the acquisition obligations below exist as a separate,
   real-time step, not because Symphony second-guesses this fact itself.
+
+## Continuation obligations (spec FR-017, data-model.md §2, research.md R11) — NEW
+
+`dispatchable` (above) is a start/admission gate only. Symphony's own reconciliation logic MUST NOT treat it
+as a continuation or preemption gate for an item Symphony has already begun executing or already holds a
+claim/block entry for:
+
+- Once Symphony has begun dispatching an item, that item's `dispatchable` fact flipping to `false` on a
+  subsequent projection refresh MUST NOT, by itself, cause Symphony to terminate the running agent, release
+  the held claim, or end a multi-turn agent run early.
+- This is not a hypothetical: because `dispatchable` is computed as "not currently claimed" (Admission
+  obligations above), the ordinary, successful claim-then-dispatch sequence required by the
+  Acquisition/release obligations below means the item Symphony itself just claimed and started executing
+  will correctly report `dispatchable: false` on the very next refresh. Bindle reporting this honestly is
+  expected, ordinary behavior, never a fault Symphony should react to by abandoning its own just-started work.
+- Symphony's existing termination/release triggers for an already-running or already-blocked item — terminal
+  state, the item leaving the active-state set, or the item disappearing from the tracker's visible set —
+  are unaffected by this obligation and remain in force exactly as for every other tracker.
+- This obligation is generic to Symphony's own reconciliation logic, not a Bindle-specific carve-out; it
+  applies identically to any tracker whose `dispatchable` computation can be affected by Symphony's own
+  claim state.
 
 ## Acquisition/release obligations (spec FR-015/FR-016, data-model.md §3) — NEW
 

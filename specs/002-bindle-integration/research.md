@@ -23,6 +23,18 @@ requires one. Both corrections and the new finding were produced by independent 
 adversarial critique passes in this session, not by re-reading the same evidence more carefully — see each
 section's "Rework" note for what specifically changed and why.
 
+**Correction pass (2026-08-27, later still)**: A subsequent, adversarially-reviewed correction pass found and
+fixed one semantic defect and two consistency issues R10's own rework had not caught: (1) R10's acquisition
+seam (FR-015) contradicts today's reconciliation logic, which reuses the same `dispatchable`-gated admission
+predicate to decide whether to *terminate already-running or already-blocked* work — meaning the ordinary
+claim-then-dispatch sequence FR-015 requires would cause Symphony to kill its own just-started execution on
+the next poll; this is now R11 (new), backing spec FR-017. (2) R8's moduledoc-correction claim conflated a fix
+applied to the separate, since-branched SQLite conversion of `Local.Store` (commit `92e137e`, now on
+`local-tracker-sqlite`, not `development`) with `development`'s own actual file — corrected in place. (3) This
+document's remaining language describing `development`'s standalone local tracker as SQLite-backed (R1) has
+been corrected to persistence-neutral language, since `development`'s `Local.Store` is JSON-file-backed as of
+this pass, not SQLite-backed — its storage format was never load-bearing for this feature's own conclusions.
+
 ## R1 — Projection transport mechanism (SQL view vs. query API vs. other)
 
 **Decision (reworked)**: Fixed, not deferred: Bindle MUST publish a **physically separate, read-only SQLite
@@ -61,11 +73,12 @@ Bindle's own words, as *"a generated, disposable file (or command output)"* — 
 
 **Alternatives considered**: A CLI-emitted artifact (command output or a generated file) — this session's
 prior leaning, reversed above; rejected now because it was based on a misapplication of D014 rather than a
-genuine blocker, and because a SQL artifact composes more directly with Symphony's existing SQLite-adapter
-patterns (`Local.Store`). A SQL view living inside Bindle's own canonical database file (same file, separate
-view) — rejected per the boundary-enforceability finding above. Mandating a SQL-view transport by direct
-analogy to `Local.Store`'s own `work_item_projection` without addressing the same-file risk — rejected as
-incomplete, not as wrong in direction.
+genuine blocker, and because a SQL artifact composes more directly with ordinary SQLite tooling than a
+CLI-emitted artifact would — a rationale independent of whatever persistence mechanism Symphony's own
+standalone local tracker (`Local.Store`) happens to use at any point in time (currently JSON-file-backed,
+`001-local-tracker-multi-agent`; that tracker's storage format is irrelevant to this transport decision). A
+SQL view living inside Bindle's own canonical database file (same file, separate view) — rejected per the
+boundary-enforceability finding above.
 
 ## R2 — Coupling risk of direct read/write database access
 
@@ -73,11 +86,12 @@ incomplete, not as wrong in direction.
 
 - **Reads MUST**, per R1, go through the physically separate, published, read-only projection artifact —
   never ad hoc read access to Bindle's own canonical internal tables (`work_items`, `work_item_blocked_by`,
-  `work_item_claims`, `work_item_evidence`). This mirrors the same discipline `Local.Store`'s own
-  `work_item_projection` view already applies internally to `work_items`, just published across the
-  Symphony/Bindle boundary as a separate artifact instead of a view within one module (R1's boundary-
-  enforceability finding is exactly why "within one module" doesn't transfer directly across a process
-  boundary).
+  `work_item_claims`, `work_item_evidence`). This mirrors the same read/write-boundary discipline the
+  separate, since-branched SQLite conversion of `Local.Store` (commit `92e137e`, now on
+  `local-tracker-sqlite`, not part of `development`) applied internally via its own `work_item_projection`
+  view — a precedent for the pattern, not a claim about `development`'s current, JSON-file-backed
+  `Local.Store`, which has no SQL view of any kind (R1's boundary-enforceability finding is exactly why
+  "within one module" doesn't transfer directly across a process boundary regardless).
 - **Writes MUST NOT** be a direct database mutation performed by Symphony's OS process against a
   Bindle-owned database file (canonical or published), under any transport choice. Symphony's tracker-write
   boundary calls into a Bindle-owned write path (an API, CLI, or other mechanism Bindle exposes) — never a
@@ -218,20 +232,31 @@ actually provide, and MUST document a real gap here rather than assume parity wi
 
 ## R8 — The `Local.Store` moduledoc correction (FR-014)
 
-**Decision**: Correct `elixir/lib/symphony_elixir/local/store.ex`'s moduledoc (lines ~19–26 as currently
-uncommitted) to remove the framing of `work_item_projection` as "the named boundary a future richer,
-externally-owned work model... would sit behind," replacing it with a plain statement that `Local.Store` is
-Symphony's own standalone, independent local-tracker implementation, and that a future Bindle-backed
-tracker (per this feature's spec) would be an entirely separate `Tracker` adapter, not a growth path of
-this module or its schema.
+**Decision (corrected)**: FR-014 is satisfied by `development`'s current
+`elixir/lib/symphony_elixir/local/store.ex` moduledoc as it stands — verified directly by reading the file
+during this specification's correction pass: it describes `Local.Store` as owning "the local work-tracking
+source's on-disk data file and establishment marker," with no language framing any part of it (or a
+`work_item_projection` view, which does not exist in this file) as a future Bindle-model growth boundary. No
+documentation change to this file is required by this feature.
 
-**Rationale**: This is the literal, already-confirmed stale assumption the originating request identified.
-Leaving it in place would actively mislead a future implementer into extending `Local.Store` for Bindle
-support, directly contradicting R3 above and spec FR-014.
+**Provenance correction**: An earlier draft of this research believed a specific `work_item_projection`-view
+moduledoc correction had already landed on `development`'s copy of this file. That correction was real, but
+it was applied to the separate SQLite conversion of `Local.Store` (commit `92e137e`, then still uncommitted)
+— which has since been split onto its own branch, `local-tracker-sqlite`, and is not part of `development`'s
+history (verified: `92e137e` is not an ancestor of current `development` HEAD). `development`'s own,
+JSON-file-backed `store.ex` was never the file that fix was applied to, and — verified independently during
+this correction pass — never carried the stale `work_item_projection`/growth-boundary language to begin
+with, so FR-014 holds for `development` regardless of that provenance mix-up.
 
-**Scope check**: A moduledoc/comment edit describing existing, unmodified behavior more accurately. No
-function signature, schema, query, or test changes. Confirmed compatible with the "no implementation code
-during the specification phase" guardrail — this is a documentation correction, not new implementation.
+**Rationale**: The underlying concern (a future implementer being misled into extending `Local.Store` for
+Bindle support) is the literal stale assumption the originating request identified. It remains addressed for
+`development`: nothing in this module's current moduledoc invites that reading, directly contradicting R3
+above would require, not merely inviting, misreading this file's own text.
+
+**Scope check**: A verification pass against existing, unmodified documentation, not a new edit. No
+function signature, schema, query, test, or documentation change to this module is required or performed by
+this feature. Confirmed compatible with the "no implementation code during the specification phase"
+guardrail.
 
 ## R9 — Concrete field shape, reworked to a native `status` passthrough (supersedes the 2026-08-27 grounding finding)
 
@@ -347,3 +372,122 @@ seam's public shape stays generic, with Bindle-specific meaning confined to the 
 Solving crash recovery now as part of this specification — rejected: doing so would require designing
 concrete reconciliation logic against a not-yet-built Bindle write API, which is implementation work for the
 eventual feature, not a specification-level decision this document can responsibly settle by itself.
+
+## R11 — Admission vs. continuation: `dispatchable` must not gate reconciliation (new, spec FR-017)
+
+**Finding**: R10's acquisition seam (FR-015) and today's reconciliation logic contradict each other once
+combined. Bindle's `dispatchable`/`eligible` computation is `status = 'open' AND` not claimed `AND` not
+blocked (R5, R9) — so the instant Symphony's acquisition callback successfully calls `claim()`, the item
+becomes claimed, and the very next projection refresh reports `dispatchable: false` for it, even though
+Symphony itself is the one holding that claim and is actively executing the item. Traced directly against
+Symphony's actual reconciliation code (not assumed):
+
+- `Issue.routable?/2` (`tracker/issue.ex:53-60`) returns `false` whenever `dispatchable: false`, independent
+  of any other field.
+- `Orchestrator.reconcile_issue_state/4` (`orchestrator.ex:421-441`), in its `cond`, checks
+  `!issue_routable?(issue)` (line 428) *before* checking whether the issue is still in an active state, and
+  on that branch calls `terminate_running_issue(state, issue.id, false)` (line 431) — which kills the running
+  agent process and clears the issue from `running`/`claimed`/`blocked`/`retry_attempts`.
+- `Orchestrator.reconcile_blocked_issue_state/4` (`orchestrator.ex:456-474`) has the identical structure for
+  blocked items: `!issue_routable?(issue)` (line 463) calls `release_issue_claim/2` (line 465), dropping the
+  held claim.
+- `AgentRunner.continue_with_issue?/2` (`agent_runner.ex:174-191`) checks
+  `active_issue_state?(...) and issue_routable?(refreshed_issue)` (line 177) between turns of a multi-turn
+  agent run; on `dispatchable: false` it returns `{:done, ...}` instead of `{:continue, ...}`, ending the run
+  early even mid-turn-sequence.
+
+All three sites reuse the exact same admission predicate (`Issue.routable?/2`, gated on `dispatchable`) that
+`candidate_issue?/3` (`orchestrator.ex:860-877`, used by `should_dispatch_issue?/4` for new dispatch and by
+`retry_candidate_issue?/2` for retry re-admission) legitimately uses to decide whether to *start* work. The
+admission usage is correctly guarded — `should_dispatch_issue?/4` only calls `candidate_issue?/3` for issues
+not already present in `running`, `claimed`, or `blocked` — but the three continuation-path sites above are
+not: they apply the same admission fact to issues Symphony already has state for. Under R10's acquisition
+seam, this means the ordinary, successful, no-error claim-then-dispatch sequence would cause Symphony to
+terminate its own execution on the very next poll — not a rare race, but the expected steady-state outcome
+of FR-015 working correctly.
+
+**Decision**: `dispatchable` MUST be a start/admission gate only (spec FR-017). Reconciliation for an issue
+Symphony already has running or blocked state for MUST NOT terminate or release solely because `dispatchable`
+becomes `false`; it MUST continue to terminate/release on terminal-state transition, the issue leaving the
+active-state set, or the issue disappearing from the tracker's visible set — the three checks already present
+in the same `cond` blocks and already orthogonal to `dispatchable` (verified: `terminal_issue_state?/2` and
+`active_issue_state?/2` read only `issue.state`; `reconcile_missing_running_issue_ids/3` and
+`reconcile_missing_blocked_issue_ids/3` read only which ids are present in the freshly fetched issue list —
+none of the four read `dispatchable`).
+
+**The smallest generic Symphony behavior change this implies**: split `Issue.routable?/2`'s two folded
+concerns — admission (`dispatchable`) and routing (label match against `tracker.required_labels`) — so that
+reconciliation can depend on the routing half without the admission half. Concretely, a future implementation
+feature should introduce a distinct predicate for "is this issue still targeted at this worker" (labels only)
+and use *that* — plus the existing, unaffected terminal/active/missing-id checks — at the three continuation
+sites above, while leaving `candidate_issue?/3` (admission, both new dispatch and retry re-admission) as the
+one place `dispatchable` continues to gate a decision. This is a generic correction to Symphony's own
+reconciliation semantics, applicable to every tracker; it requires no Bindle-specific branch, since the
+callback names, the predicate split, and the call sites are all adapter-agnostic.
+
+**Compatibility impact on existing adapters — analyzed, not assumed zero** (checked every current producer of
+`dispatchable`, `elixir/lib/symphony_elixir/*/client.ex` and `local/adapter.ex`):
+
+- `local` (`local/adapter.ex:90`) and `gitlab` (`gitlab/client.ex:198`): `dispatchable: true`, an unconditional
+  constant. Dropping `dispatchable` from continuation is a pure no-op for these two — there is no scenario in
+  which it was ever `false` to begin with.
+- `github` (`github/client.ex:199`): `dispatchable: not Map.has_key?(issue, "pull_request")` — a structural,
+  time-invariant fact (a GitHub "issue" cannot become a "pull_request" mid-run). No continuation behavior
+  depends on this changing after dispatch; removing it from continuation is a no-op in practice.
+- `jira` (`jira/client.ex:337-349`): `dispatchable?/4` is `not blocks_gate_dispatch?(state, status_category)
+  or Enum.all?(blockers, &terminal_blocker?/2)` — `blocks_gate_dispatch?/2` is `true` only while
+  `status_category` is `"new"` or `state` is `"todo"`/`"to do"`. Once a Jira issue has actually moved into an
+  active/in-progress status (which it must have, for Symphony to have dispatched it),
+  `not blocks_gate_dispatch?(...)` is already `true` on its own, making the whole expression `true`
+  regardless of the blocker-terminality half — i.e. the full expression, not just one half of it, is already
+  inert post-dispatch; removing `dispatchable` from continuation costs nothing observable for Jira.
+- `asana` (`asana/client.ex:223`): `dispatchable: task["completed"] == false and task["resource_subtype"] !=
+  "section"`. **This is a real, unresolved compatibility gap, not a redundant one** — verified directly
+  against `asana/client.ex:204-228`: `Issue.state` for this adapter is set from
+  `get_in(membership, ["section", "name"])` (the task's Kanban-column/section name), a field entirely
+  independent of `task["completed"]`. A task can flip `completed: true` (and so `dispatchable: false`) while
+  remaining in whatever section it was already in — a section whose name has no necessary relationship to any
+  configured `terminal_states` value. `terminal_issue_state?/2` therefore does **not** reliably catch this
+  case via `issue.state` the way it does for a genuine terminal-state transition; whether it happens to for a
+  *given* deployment depends entirely on that deployment's own `active_states`/`terminal_states` configuration
+  and Asana project/section setup, not on anything this adapter's code guarantees. The eventual implementation
+  feature MUST verify this gap directly against Asana's actual `dispatchable`-continuation behavior — the
+  same way Linear's case requires resolution below — rather than assume it is already covered.
+- `linear` (`linear/client.ex:496-499`): `dispatchable?/4` is `assigned_to_worker?(assignee, assignee_filter)
+  and not blocked_before_dispatch?(...)`. The `blocked_before_dispatch?/2` half is pre-dispatch-only (gated on
+  `state_name == "todo"`), same inert-after-dispatch reasoning as Jira. The `assigned_to_worker?/2` half is
+  **not** inert: it re-evaluates on every poll regardless of state, so an operator reassigning a Linear ticket
+  away from Symphony's configured `assignee_filter` mid-run is the one real, load-bearing case today's
+  `dispatchable`-based continuation check legitimately catches — this is exactly the "no longer routed to
+  this worker" scenario the orchestrator's own log message already names. **This is a genuine compatibility
+  implication, not a hypothetical**: naively dropping `dispatchable` from continuation, without replacing it,
+  would silently stop Symphony from halting a Linear-tracked agent run when the underlying ticket is
+  reassigned away mid-run. The eventual implementation feature MUST either (a) expose a distinct,
+  continuation-facing "still assigned/routed to this worker" signal for Linear (and any future adapter with
+  similar semantics) separate from admission `dispatchable`, or (b) explicitly document, as a deliberate,
+  reviewed trade-off (not a silent regression), that this specific continuation behavior is no longer
+  provided. This document takes no position on which of (a)/(b) the implementation feature should choose —
+  only that the choice must be made explicitly, since both are real behavior changes for an existing,
+  already-shipped adapter.
+
+**Rationale**: This is the same category of correction as R10 — a genuine, verified defect in Symphony's own
+core reconciliation logic, not a Bindle-specific concern, discovered only because a durable-claim-aware
+tracker (Bindle) is the first tracker to make `dispatchable` a function of Symphony's own acquisition state.
+Most existing adapters' `dispatchable` is either constant, structurally time-invariant, or verifiably
+redundant with an already-independent terminal/active-state check (local, gitlab, github, jira) — but two
+real, unresolved compatibility questions remain and must not be waved away as already covered: Linear's
+assignee-reassignment case (confirmed load-bearing and not independently caught by any other check) and
+Asana's `completed`-vs-section-name gap (confirmed structurally possible, whose actual impact depends on a
+given deployment's configuration and so cannot be confirmed closed at the specification level). Both must be
+explicitly resolved — preserved through a distinct mechanism or explicitly, knowingly dropped — not silently
+lost.
+
+**Alternatives considered**: Leaving reconciliation as-is and requiring a future Bindle adapter to
+never let `dispatchable` go `false` for an item it has claimed (i.e. push the fix into the adapter) —
+rejected: this asks a Bindle-backed adapter to misrepresent Bindle's own honest state (an item genuinely is
+claimed) to work around a Symphony-side defect, and does nothing for a hypothetical future adapter with the
+same shape. Ignoring the Linear and Asana compatibility questions and assuming dropping `dispatchable` from continuation
+is harmless — rejected: contradicted directly by `linear/client.ex:497`'s `assigned_to_worker?/2` check (a
+real, currently-shipped, adapter-observable behavior) and by `asana/client.ex:207,223`'s independent
+`state`/`dispatchable` fields (a real, structurally-possible gap this document cannot responsibly certify
+closed without knowing a given deployment's own state configuration).

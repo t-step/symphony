@@ -20,28 +20,23 @@ behaviour/orchestrator changes FR-015 requires.
 
 **Correction to this plan's prior framing**: an earlier draft of this plan stated its only in-scope change
 was a one-file moduledoc correction to `elixir/lib/symphony_elixir/local/store.ex` (spec FR-014), described
-at the time as "currently uncommitted." That correction is **already landed** in the current codebase —
-verified directly by reading the file during this feature's rework — as part of the separate, already-
-committed local-tracker JSON-to-SQLite conversion on this same git branch. This plan therefore authorizes
-**zero** source code changes of its own; FR-014 is satisfied by already-existing code, not by work this plan
-performs.
+at the time as "currently uncommitted." `development`'s own current copy of that file — JSON-file-backed —
+was verified directly, during this feature's correction pass, to carry no stale language needing correction
+in the first place (research.md R8). This plan therefore authorizes **zero** source code changes of its own;
+FR-014 is satisfied by `development`'s already-existing code, not by work this plan performs.
 
-**Repository hygiene: the JSON-to-SQLite conversion does not belong on this branch.** That conversion
-(commit `92e137e`, converting `Local.Store`/`Local.Adapter` from JSON to SQLite) and this feature's own spec
-commit (`93f60ca`) are two disjoint, unrelated changes that happen to share a branch — verified via full diff
-review: the two commits touch entirely disjoint file sets, and the only mention of "Bindle" anywhere in the
-SQLite-conversion commit's diff is `store.ex`'s moduledoc, which already correctly disclaims any Bindle
-relationship. Recommended separation, since both commits are already pushed to `origin/002-bindle-integration`
-and rewriting pushed history requires a force-push the user must explicitly authorize:
-
-```bash
-git branch local-tracker-sqlite 92e137e        # capture the SQLite conversion as its own branch tip
-git rebase --onto development 92e137e 002-bindle-integration   # drop 92e137e from this branch's history
-# then: open local-tracker-sqlite as its own PR into development; force-push 002-bindle-integration only after review
-```
-
-This plan does not perform this separation itself — it is a repository-hygiene action outside this
-specification's own scope, requiring explicit user authorization before any force-push.
+**Repository hygiene (resolved)**: An earlier draft of this plan found the JSON-to-SQLite conversion of
+`Local.Store`/`Local.Adapter` (commit `92e137e`) sharing this branch's history with this feature's own spec
+commit (`93f60ca`) — two disjoint, unrelated changes (verified via full diff review: entirely disjoint file
+sets; the only mention of "Bindle" anywhere in the SQLite-conversion commit's diff is `store.ex`'s moduledoc,
+which correctly disclaims any Bindle relationship) — and recommended splitting the conversion onto its own
+branch before any force-push. **That separation has since been performed**: `92e137e` now lives on branch
+`local-tracker-sqlite` and is no longer part of `development`'s history (verified: `git merge-base
+--is-ancestor 92e137e HEAD` fails against current `development`). `development`'s standalone local tracker
+is therefore JSON-file-backed, not SQLite-backed, as of this specification's correction pass — every other
+reference to its persistence mechanism throughout this feature's artifacts has been corrected to
+persistence-neutral language accordingly, since the storage format is irrelevant to this integration
+boundary and may change again independently of this feature without requiring another such correction pass.
 
 ## Technical Context
 
@@ -52,11 +47,13 @@ of its own (see Summary's correction above).
 Bindle-backed adapter's dependencies (if any), and the new `Tracker` behaviour acquisition/release callback
 pair FR-015 requires, are out of scope for this plan and belong to the eventual implementation feature.
 
-**Storage**: N/A for this feature's own scope. Symphony's standalone local tracker storage
-(`Local.Store`'s SQLite database, `001-local-tracker-multi-agent`) is unmodified in shape or behavior. The
-published Bindle-facing projection artifact's physical shape (a separate, read-only, schema-versioned
-SQLite file — spec FR-002, research.md R1) is now fixed by this feature at the specification level, but
-producing it is Bindle's own implementation, entirely outside this repository.
+**Storage**: N/A for this feature's own scope. Symphony's standalone local tracker storage (`Local.Store`,
+`001-local-tracker-multi-agent` — currently JSON-file-backed in `development`; its concrete persistence
+mechanism is irrelevant to and unconstrained by this feature, see spec User Story 4) is unmodified in shape
+or behavior. The published Bindle-facing projection artifact's physical shape (a separate, read-only,
+schema-versioned SQLite file that Symphony's future adapter opens in SQLite's own read-only mode — spec
+FR-002, research.md R1) is now fixed by this feature at the specification level, but producing it is
+Bindle's own implementation, entirely outside this repository.
 
 **Testing**: `mix test` / `make all`, unchanged toolchain. This feature makes no code change, so no new test
 is required or possible at this feature's own scope. The eventual implementation feature that builds the
@@ -172,6 +169,38 @@ original design and the grounding pass both missed:
   findings (acquisition-seam timing/crash-recovery, projection field sufficiency, transport/ownership
   boundary) that drove these corrections.
 
+### Correction-Pass Re-Check (2026-08-27, later still — post-implementation-discipline review)
+
+A further review, tracing R10's acquisition seam against Symphony's actual reconciliation code rather than
+assuming it composes cleanly, found one more genuine defect and two consistency issues, corrected via
+research.md R11 (new), R8 (corrected), and persistence-neutral language throughout this feature's artifacts.
+
+- **R11 (new) — admission vs. continuation**: R10's acquisition seam (FR-015), once combined with today's
+  reconciliation logic, contradicts it — the ordinary claim-then-dispatch sequence FR-015 requires would
+  cause Symphony's own reconciliation to terminate the execution it just started, on the very next poll,
+  because reconciliation currently reuses the same `dispatchable`-gated admission predicate to decide
+  continuation. This produced spec FR-017, a second narrow, generic correction to Symphony's own core
+  reconciliation semantics. **II still PASS, same justification pattern as FR-015/FR-016's exception above**:
+  it is a verified, load-bearing correctness requirement (not speculative), it introduces no Bindle-specific
+  branch, and its scope is fixed narrowly (three named continuation call sites) by this specification rather
+  than left open-ended. **I/III/IV/VI/VII unaffected** — like FR-015/FR-016, this is a specification-level
+  requirement with no code yet written against it; the eventual implementation feature must verify every
+  existing adapter's continuation behavior is preserved or explicitly, deliberately changed (research.md
+  R11's Linear and Asana compatibility findings), not silently regressed.
+- **R8 (corrected) — FR-014 provenance**: an earlier pass believed a `work_item_projection`-view moduledoc
+  correction had already landed on `development`'s copy of `local/store.ex`; that correction was real but
+  belonged to the separate SQLite conversion of this module (commit `92e137e`), since split onto branch
+  `local-tracker-sqlite` and no longer part of `development`. `development`'s own JSON-backed file never
+  carried the stale language FR-014 concerns, so FR-014 still holds, independently confirmed rather than
+  inherited from a mismatched provenance claim. No Constitution implication — this is a factual correction,
+  not a scope or design change.
+- **Persistence-neutral language**: every remaining reference in this feature's artifacts to Symphony's
+  standalone local tracker as "SQLite-backed" has been corrected — `development`'s `Local.Store` is
+  JSON-file-backed, and this feature's ownership-boundary claims (FR-014, User Story 4) never depended on
+  its storage format to begin with. No Constitution implication.
+
+No Constitution gate FAILs as a result of this correction pass.
+
 ## Project Structure
 
 ### Documentation (this feature)
@@ -190,11 +219,11 @@ specs/002-bindle-integration/
 
 ### Source Code (repository root)
 
-This feature makes **zero** source changes. FR-014's moduledoc correction to
-`elixir/lib/symphony_elixir/local/store.ex` is already landed in the codebase, verified during this
-feature's rework — no file in the repository is touched by this plan.
+This feature makes **zero** source changes. `development`'s current
+`elixir/lib/symphony_elixir/local/store.ex` was verified during this feature's correction pass to already
+satisfy FR-014 as-is (research.md R8) — no file in the repository is touched by this plan.
 
-A future, separate implementation feature (out of scope here) would eventually make two kinds of change,
+A future, separate implementation feature (out of scope here) would eventually make three kinds of change,
 sketched in `data-model.md`/`contracts/bindle-schedulable-projection.md` for continuity, but **not created or
 modified by this plan**:
 
@@ -204,14 +233,26 @@ elixir/
     ├── tracker.ex              # NOT modified by this feature — sketch only: a future feature adds one new
     │                           #   OPTIONAL callback pair (acquisition/release, FR-015/data-model.md §3),
     │                           #   `@optional_callbacks`-guarded so every existing adapter is unaffected.
+    ├── tracker/issue.ex        # NOT modified by this feature — sketch only: a future feature splits
+    │                           #   `routable?/2`'s admission (`dispatchable`) and routing (labels) concerns
+    │                           #   so continuation call sites can depend on routing without re-testing
+    │                           #   admission (FR-017/data-model.md §2, research.md R11).
     ├── orchestrator.ex         # NOT modified by this feature — sketch only: a future feature wires calls to
-    │                           #   that new optional callback pair at `do_dispatch_issue/4` (before
+    │                           #   the new optional callback pair at `do_dispatch_issue/4` (before
     │                           #   `Task.Supervisor.start_child`) and at `release_issue_claim/2`/
     │                           #   `terminate_running_issue/3`, plus new startup-time reconciliation logic
-    │                           #   for the crash-recovery gap research.md R10 identifies as unresolved.
+    │                           #   for the crash-recovery gap research.md R10 identifies as unresolved; and
+    │                           #   corrects `reconcile_issue_state/4`/`reconcile_blocked_issue_state/4` to
+    │                           #   stop re-testing `dispatchable` for an item already running/blocked
+    │                           #   (FR-017), while resolving Linear's assignee-reassignment continuation
+    │                           #   stop and Asana's completed-vs-section-name gap, each through a distinct
+    │                           #   mechanism or an explicit, documented trade-off (research.md R11).
+    ├── agent_runner.ex         # NOT modified by this feature — sketch only: a future feature corrects
+    │                           #   `continue_with_issue?/2` the same way, for the same reason (FR-017).
     └── bindle/                 # NOT created by this feature — sketch only, for a future implementation
         ├── adapter.ex          # would implement @behaviour SymphonyElixir.Tracker (including the new
-        │                       #   optional callbacks), mirroring local/adapter.ex
+        │                       #   optional callbacks), mirroring local/adapter.ex, and open the published
+        │                       #   SQLite artifact in SQLite's own read-only mode (spec FR-002)
         └── ...                 # supporting modules (naming, count, and shape decided at that feature's own planning stage)
 ```
 

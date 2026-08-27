@@ -19,38 +19,63 @@ Its validation therefore splits into two parts: what can be checked **now**, by 
 3. **Expected outcome**: no diff is needed to `tracker.ex` or `tracker/issue.ex` to support the design this
    spec describes.
 
-### Scenario B: The `Local.Store` moduledoc no longer implies a shared future store (FR-014, SC-003)
+### Scenario B: The `Local.Store` moduledoc does not imply a shared future store (FR-014, SC-003)
 
 1. Open `elixir/lib/symphony_elixir/local/store.ex` and read its moduledoc.
-2. **Expected outcome**: it states that `Local.Store` is Symphony's own standalone, independent local
-   work-tracking implementation, and that a future Bindle-backed tracker is a separate `Tracker` adapter —
-   not that `work_item_projection` (or any other part of this module) is "the boundary" a future
-   Bindle model grows into or shares.
-3. Run the existing local-tracker test suites to confirm the correction changed no behavior:
+2. **Expected outcome**: nothing in it states or implies that `Local.Store`'s data file, schema, or module is
+   the location a future Bindle model will grow into, is shared with a future Bindle-backed tracker, or is
+   otherwise the same system as one — verified directly against `development`'s current, JSON-file-backed
+   moduledoc, which describes `Local.Store` only as owning "the local work-tracking source's on-disk data
+   file and establishment marker" (research.md R8).
+3. Run the existing local-tracker test suites to confirm this verification changed no behavior:
    ```bash
    cd elixir && mix test test/symphony_elixir/local_store_test.exs test/symphony_elixir/local_adapter_test.exs test/symphony_elixir/local_init_test.exs
    ```
    **Expected outcome**: all tests pass, identically to before this feature's documentation correction.
 
-### Scenario C: Membership vs. admission needs no new Symphony-side logic (User Story 3, SC-002)
+### Scenario C: Membership vs. admission needs no new Symphony-side logic for new dispatch (User Story 3, SC-002)
 
 1. Open `elixir/lib/symphony_elixir/tracker/issue.ex` and confirm `routable?/2` already gates on
    `dispatchable` before consulting labels, and that `blocked_by` is carried as informational data rather
    than used to compute dispatch eligibility inside Symphony.
-2. **Expected outcome**: a hypothetical Bindle-backed adapter record with `dispatchable: false` is already
-   excluded from scheduling by existing, unmodified code — no Bindle-specific branch is needed anywhere in
-   `orchestrator.ex` or `tracker.ex`.
+2. Confirm `orchestrator.ex`'s `candidate_issue?/3` (used by `should_dispatch_issue?/4` for new dispatch and
+   `retry_candidate_issue?/2` for retry re-admission) is guarded to apply only to issues not already present
+   in `running`, `claimed`, or `blocked`.
+3. **Expected outcome**: a hypothetical Bindle-backed adapter record with `dispatchable: false` is already
+   excluded from *new* scheduling by existing, unmodified admission code — no Bindle-specific branch is
+   needed in `candidate_issue?/3` or `tracker.ex`. **This scenario validates admission only** — it does not
+   by itself validate continuation; see Scenario E below for the corrected invariant FR-017 requires there.
 
 ### Scenario D: The acquisition/release seam is narrow and its call sites are identifiable (User Story 2, FR-015)
 
 1. Open `elixir/lib/symphony_elixir/orchestrator.ex` and locate `do_dispatch_issue/4` (the point immediately
    before `spawn_issue_on_worker_host/5`/`Task.Supervisor.start_child`), `release_issue_claim/2`, and
    `terminate_running_issue/3`.
-2. Confirm these are exactly the call sites data-model.md §3 names for the new optional acquisition/release
-   callback pair, and that today's in-memory `state.claimed` `MapSet` bookkeeping at those same sites is
-   what the new callbacks run alongside, not replace.
+2. Confirm these are exactly the call sites data-model.md §3 describes conceptually (immediately before
+   treating a candidate issue as dispatched, and at every existing claim-release point) and research.md R10 /
+   plan.md's Project Structure sketch name explicitly, for the new optional acquisition/release callback
+   pair, and that today's in-memory `state.claimed` `MapSet` bookkeeping at those same sites is what the new
+   callbacks run alongside, not replace.
 3. **Expected outcome**: no other location in the orchestrator needs to change to satisfy FR-015 — the seam
    is exactly two call sites, both already load-bearing for today's in-memory claim bookkeeping.
+
+### Scenario E: `dispatchable` does not gate continuation today — the defect FR-017 requires correcting (User Story 2, FR-017)
+
+1. Open `elixir/lib/symphony_elixir/orchestrator.ex` and read `reconcile_issue_state/4` (~line 421) and
+   `reconcile_blocked_issue_state/4` (~line 456); open `elixir/lib/symphony_elixir/agent_runner.ex` and read
+   `continue_with_issue?/2` (~line 174).
+2. Confirm all three currently call an `issue_routable?/1` wrapper around `Issue.routable?/2` — gated on
+   `dispatchable`, identical in body to the admission path's (Scenario C) usage, but defined as two separate,
+   module-private functions (`orchestrator.ex`'s own `issue_routable?/1`, used by both orchestrator sites, and
+   a second, independently-defined `issue_routable?/1` in `agent_runner.ex` — not one function shared across
+   both modules) — and that on `dispatchable: false` each one respectively calls `terminate_running_issue/3`,
+   calls `release_issue_claim/2`, or returns `{:done, ...}` instead of `{:continue, ...}`.
+3. **Expected outcome (today, before FR-017 is implemented)**: this confirms the defect research.md R11
+   documents — none of these three sites currently distinguish "no longer routed to this worker" from
+   "currently claimed by us, because we just successfully acquired it." This scenario exists to make that
+   defect concretely locatable for the eventual implementation feature, not to demonstrate it is already
+   fixed; **it is expected to still show the unmodified, pre-FR-017 behavior** until that future feature
+   lands the correction research.md R11 describes.
 
 ## Part 2 — Validate once a Bindle-backed adapter is actually implemented (future feature, out of scope here)
 
@@ -103,3 +128,15 @@ Bindle-side work this specification requires without itself performing.
    research.md R10 identifies as required (querying Bindle for this instance's own stranded claims and
    releasing them), or (b) the implementation feature's plan explicitly documents this as a known,
    unresolved limitation rather than silently omitting it.
+7. **Acquiring an item does not terminate it (FR-017, research.md R11)**: dispatch a fixture item, confirm
+   the acquisition callback succeeds and the agent starts running, then confirm a subsequent projection
+   refresh reporting `dispatchable: false` for that same item (the expected result of it now being claimed)
+   does **not** terminate the running agent or release the claim — only a terminal-state transition, the
+   item leaving the active-state set, or the item disappearing from the projection does. Separately confirm,
+   for a Linear-tracked deployment, that reassigning a ticket away from Symphony's configured assignee
+   filter mid-run still stops the agent, and for an Asana-tracked deployment, that a task completing mid-run
+   while its section/state has not reached a configured `terminal_states` value is handled as research.md
+   R11 requires (research.md R11's compatibility findings) — i.e. confirm the implementation feature either
+   replaced `dispatchable`-based continuation with a distinct, explicit "still routed to this worker" signal
+   for each, or explicitly and knowingly documented dropping that behavior, rather than silently regressing
+   it.

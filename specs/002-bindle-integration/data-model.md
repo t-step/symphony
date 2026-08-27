@@ -3,11 +3,12 @@
 Feature: [spec.md](./spec.md) | Plan: [plan.md](./plan.md)
 
 This feature introduces one new orchestrator-facing seam (§3, the acquisition/release callback pair,
-research.md R10) beyond the read-side projection. It defines the **physical** shape of Bindle's published
-projection artifact and confirms it maps 1:1 onto the existing `SymphonyElixir.Tracker.Issue` struct with no
-new struct field. Nothing in this feature changes `Tracker.Issue` itself — see `SPEC.md` §4.1.1 and
-`001-local-tracker-multi-agent`'s `data-model.md` §1 for the existing entity this feature reuses without
-modification.
+research.md R10) beyond the read-side projection, plus one corrected orchestrator-facing invariant governing
+how the read-side projection's `dispatchable` fact may be used (§2, spec FR-017, research.md R11). It defines
+the **physical** shape of Bindle's published projection artifact and confirms it maps 1:1 onto the existing
+`SymphonyElixir.Tracker.Issue` struct with no new struct field. Nothing in this feature changes `Tracker.
+Issue` itself — see `SPEC.md` §4.1.1 and `001-local-tracker-multi-agent`'s `data-model.md` §1 for the
+existing entity this feature reuses without modification.
 
 ## 1. Bindle-Facing Schedulable Projection Record (physical shape fixed — research.md R1, R9)
 
@@ -55,6 +56,15 @@ always query by column name, never positionally. This also protects against a mi
 the local tracker's own path validation today only checks "non-empty string," which a Bindle adapter must not
 naively inherit unchanged.
 
+**Read-only enforcement**: Physical separation (§ above) structurally prevents Symphony's adapter from ever
+opening a connection that also contains Bindle's canonical tables, but it does not by itself make the
+artifact read-only to Symphony's own process — nothing stops that process from issuing a write statement
+against a physically separate file it has permission to write. Symphony's adapter MUST therefore open the
+published artifact using SQLite's own read-only open mode (e.g. a read-only connection/URI such as
+`mode=ro`) as the enforced, application-level requirement, not merely an adapter implementation that happens
+never to issue a write statement, and MUST NOT create, migrate, or repair this file under any circumstance —
+publication and replacement of the artifact belong to Bindle alone.
+
 ## 2. Projection Membership vs. Admission (two independent axes — research.md R5)
 
 Restated here as a data-model-level invariant, since it governs how every record in §1 is produced:
@@ -74,9 +84,20 @@ Restated here as a data-model-level invariant, since it governs how every record
   outright. Both representations (omit entirely, or include as non-dispatchable) satisfy spec FR-002; the
   eventual implementation feature confirms which one Bindle actually produces.
 
-Symphony's read side requires no change to support either representation: `Tracker.Issue.routable?/2` already
-gates on `dispatchable` first (`tracker/issue.ex`), so a non-dispatchable member record is already correctly
-excluded from scheduling today, with no Bindle-specific logic required.
+Symphony's read side requires no change to support either representation for *admission*: `Tracker.Issue.
+routable?/2` already gates on `dispatchable` first (`tracker/issue.ex`), so a non-dispatchable member record
+is already correctly excluded from *new* dispatch today, with no Bindle-specific logic required.
+
+**This does not extend to continuation.** `dispatchable` is a start/admission gate only (spec FR-017,
+research.md R11) — it MUST NOT be treated as a reason to terminate an issue Symphony has already begun
+executing or already holds a claim/block entry for. This distinction matters specifically because it is not
+hypothetical for Bindle: `dispatchable` is computed as `status = 'open' AND` not claimed `AND` not blocked
+(§1 above), so the instant Symphony's own acquisition (§3 below) succeeds, the item becomes claimed and the
+very next projection refresh reports `dispatchable: false` for the item Symphony itself is now executing.
+Today's reconciliation (`Orchestrator.reconcile_issue_state/4`, `reconcile_blocked_issue_state/4`,
+`AgentRunner.continue_with_issue?/2`) currently reuses the same admission predicate for this continuation
+decision and would terminate that execution on the next poll — see research.md R11 for the full trace and the
+per-adapter compatibility analysis of correcting this generically.
 
 ## 3. Tracker Acquisition/Release Seam (new — spec FR-015/FR-016, research.md R10)
 
@@ -135,11 +156,13 @@ second, richer read/write surface.
 
 ## 5. Symphony Standalone Local Tracker (existing, unmodified — `001-local-tracker-multi-agent`)
 
-No change to `Local.Store`'s schema, queries, or behavior. The FR-014 moduledoc correction removing language
-that described its `work_item_projection` view as a future Bindle-model growth boundary is **already landed**
-in the current codebase (verified directly against `elixir/lib/symphony_elixir/local/store.ex` during this
-feature's rework) — no further change to that module is required by this feature. `work_items`,
-`work_item_projection`, and every existing field remain exactly as `001-local-tracker-multi-agent` already
-specifies and implements them. The separate JSON-to-SQLite conversion of this module (a distinct, already-
-landed commit on this same git branch) has zero coupling to this feature — see `plan.md`'s Project Structure
-for the recommended repository-hygiene separation of that commit from this branch.
+No change to `Local.Store`'s schema, queries, or behavior. `development`'s current
+`elixir/lib/symphony_elixir/local/store.ex` is JSON-file-backed, and its moduledoc was verified, directly,
+during this feature's correction pass, to carry no language framing any part of it as a future Bindle-model
+growth boundary — FR-014 is satisfied by this file's actual current content, not by a documentation change
+this feature performs. (research.md R8 corrects an earlier provenance mix-up: a real `work_item_projection`
+-view moduledoc fix exists in commit `92e137e`, but that commit belongs to the separate JSON-to-SQLite
+conversion of this module, which has since been split onto its own branch, `local-tracker-sqlite`, and is not
+part of `development`'s history — `development`'s own file was never the one that fix applied to, and never
+needed it.) This conversion has zero coupling to this feature regardless of which branch it lives on — see
+`plan.md`'s Project Structure for the repository-hygiene history.
