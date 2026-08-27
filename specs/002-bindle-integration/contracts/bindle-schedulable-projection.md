@@ -189,6 +189,16 @@ fact above is advisory only and MUST NOT be treated as sufficient proof of acqui
   three operations exists — this contract's FR-009 lifecycle-write obligation and FR-016's narrower
   claim/release exception both remain correctly scoped: a future Bindle-backed adapter's read of
   "supported write path" now resolves to these three functions, not to an unresolved dependency.
+- **`done` is a task-scoped, agent-authorizable write; Bindle's own supported write surface has no
+  milestone-acceptance operation for Symphony to call at all (spec FR-013, research.md R16)**: `complete_task()`
+  /`bindle work done <id>` categorically rejects a milestone id (`not_a_task`) rather than accepting one, and
+  takes no `--owner`/claim argument — Bindle's own model does not gate a task's `done` transition on human
+  review (`docs/DECISIONS.md` D038: "readiness is mechanical; acceptance is semantic"). This means an agent's
+  FR-009-authorized, session-scoped request to mark its own bound *task* done is squarely inside this
+  contract's existing Write obligations (below) — a Bindle-owned supported write operation, scoped to the
+  session's bound item — not a new write category. Milestone `accepted` (`accept_milestone()`) has no CLI
+  surface this contract or FR-009 authorizes Symphony to call at all; nothing in this specification permits a
+  future adapter to invoke it.
 
 ## Failure-surface obligations (spec FR-007, FR-008, research.md R7)
 

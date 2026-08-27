@@ -15,6 +15,20 @@ blindly from a review prompt. None of these corrections reopen `002-bindle-integ
 feature conform to it more closely (in particular FR-013/User Story 5's semantic-judgment boundary, which
 the first draft's `done`-tool design would have crossed).
 
+**Second correction pass (2026-08-27, same day)**: R9 was rewritten and R16–R19 added after
+`002-bindle-integration`'s own FR-013 correction (that spec's research.md R16: task `done` is a mechanical,
+agent-triggerable execution fact, distinct from milestone `accepted`) and further Symphony-runtime grounding
+found this feature's first correction pass had itself overcorrected or left gaps: (1) the first pass's
+removal of any agent-invoked completion tool read `002-bindle-integration` User Story 5 more broadly than
+its own corrected wording supports — R17 restores a narrowly-scoped one; (2) the acquisition call site and
+`retry_candidate_issue?/2` re-validation, both shared between fresh dispatch and retry-continuation, were
+never checked against Bindle's actual claim-uniqueness constraint for the retry-of-an-already-claimed-item
+case — R16 fixes this; (3) R9's `routed_by_assignment` field was Linear-shaped by construction and did not
+actually close Asana's own gap despite claiming to — rewritten below; (4) Bindle's `publish` mechanism was
+never grounded — R18 does so and designs the restored tool's projection-refresh behavior; (5) the startup
+reconciliation sweep's individual-failure retry liveness was never addressed — R19 fixes it using existing
+scheduling infrastructure.
+
 ## R1: Read-only SQLite access to the published projection
 
 **Decision**: Use the existing `exqlite` dependency (`mix.lock`, `~> 0.30`, resolving `0.40.0`), opening
@@ -161,6 +175,14 @@ exists to close (User Story 2). A later, separate metadata-enrichment call updat
 such update operation, and this feature has no requirement that depends on Bindle knowing the real
 workspace path.
 
+**Second-pass addition**: R6's call site (`spawn_issue_on_worker_host/5`, immediately before
+`Task.Supervisor.start_child/2`) is reached by **both** a fresh dispatch and a continuation retry
+(`handle_active_retry/4` → `do_dispatch_issue/4` → `spawn_issue_on_worker_host/5` — the identical function,
+verified directly against `orchestrator.ex`'s actual control flow, not assumed). Calling `acquire_issue/2`
+unconditionally at this shared site, as R6 originally described without qualification, is only correct for
+the fresh-dispatch case — see R16 below for why an unconditional call here breaks the ordinary
+crash-mid-run retry case R7 governs, and the fix (gate the call on `state.claimed` membership).
+
 ## R7: Release semantics — single call site, retry-vs-spawn-failure distinction (revised)
 
 **Decision**: `release_issue/2` is invoked from exactly one place in the orchestrator's own logic per
@@ -212,31 +234,65 @@ from the two new functions, rather than deleting it, means `candidate_issue?/3` 
 `routable?/2`, duplicating the label-match logic — rejected: two independent implementations of the same
 label-match rule risk drifting out of sync; composing from a shared `routed?/2` avoids that.
 
-## R9: Per-adapter continuation-signal compatibility
+## R9: Per-adapter continuation-signal compatibility (rewritten, second correction pass — supersedes the original `routed_by_assignment` design)
 
-**Decision**: Add a `routed_by_assignment: boolean()` field to `Tracker.Issue` (default `true`, meaning
-"this adapter has no assignment-reassignment concept, so assignment never blocks continuation"), populated
-by Linear's client (`elixir/lib/symphony_elixir/linear/client.ex`) with its existing
-assignee-still-matches computation, and left at its default by every other adapter. `routed?/2` (R8)
-consults this field in addition to label match.
+**Original decision (historical, now superseded)**: Add a `routed_by_assignment: boolean()` field to
+`Tracker.Issue`, populated only by Linear, and leave Asana unpopulated on the claim that its
+`completed`-vs-section-name distinction was "a `state`/label concern already covered by the existing
+label-match path."
 
-**Rationale**: Verified directly (`linear/client.ex:496-499`, `defp dispatchable?(state_name, blockers,
-assignee, assignee_filter)`) that Linear's client already computes `assigned_to_worker?(assignee,
-assignee_filter) and not blocked_before_dispatch?(state_name, blockers)` and folds the result straight
-into `dispatchable` today — exactly why splitting `dispatchable` from routing without also carrying this
-signal forward would silently drop Linear's real, load-bearing reassignment-stop behavior. Verified
-Asana's adapter (`asana/client.ex:223`, `dispatchable: task["completed"] == false and
-task["resource_subtype"] != "section"`) has no equivalent assignment-based continuation signal — its
-continuation-relevant distinction is `completed`-vs-section-name, which is a `state`/label concern already
-covered by the existing label-match path, not an assignment concern — so Asana needs no equivalent field
-population, only confirmation via its own test suite that this feature's change does not alter its
-behavior.
+**Why this was wrong**: That claim was never actually verified against Asana's code — it was an assumption.
+Re-verified directly, second correction pass: `asana/client.ex`'s `normalize_issue/2` (lines 204–228) sets
+`state` from `get_in(membership, ["section", "name"])` (line 207) — the task's Kanban-column/section name —
+and sets `dispatchable` from `task["completed"] == false and task["resource_subtype"] != "section"` (line
+223), two **independently fetched, independently computed** fields with no code anywhere tying them
+together. Asana's own API lets a task's `completed` flag flip to `true` while its section membership (and
+therefore `state`) stays exactly as it was — there is nothing in this adapter's code that would make
+`state` change merely because `completed` did. This means the original R9's premise (label/state match
+already catches this) is false: a task that completes without moving sections would, under the original
+`routed_by_assignment`-only design, keep `routed?/2` returning `true` (label match unchanged, no assignment
+field populated for Asana) even though it has genuinely completed — continuation would incorrectly persist.
+Also, `routed_by_assignment`'s own name and default semantics ("no assignment concept, so assignment never
+blocks continuation") are Linear-shaped by construction and do not generalize to a fact that isn't about
+assignment at all.
 
-**Alternatives considered**: Computing the assignment-still-matches check independently inside
-`Orchestrator`/`AgentRunner` by comparing `issue.assignee_id` against configured settings at continuation
-time — rejected: `assignee_id` alone does not carry the adapter-specific matching rule (e.g. Linear's own
-filter semantics), and reimplementing that rule outside the adapter that already computes it correctly
-risks exactly the kind of drift Constitution II warns against.
+**Decision**: Rename the field `continuation_allowed: boolean()` (default `true`, meaning "this adapter has
+no independent continuation-revoking fact beyond label match, or the fact currently holds"), and populate it
+for **two** adapters, not one:
+
+- **Linear** (`linear/client.ex:496-499`): unchanged computation, `assigned_to_worker?(assignee,
+  assignee_filter)` — Linear's existing still-assigned-to-this-worker check, previously folded silently into
+  `dispatchable`, now surfaced as its own field with the same value.
+- **Asana** (`asana/client.ex:223`): `task["completed"] == false`, independent of `resource_subtype` (which
+  is a projection-membership concern, not a continuation one) and independent of `state`/section — this is
+  the actual fix for the gap above: a task's continuation now correctly stops the moment `completed` flips
+  to `true`, regardless of what its section name says.
+
+`routed?/2` (R8) consults `continuation_allowed` in addition to label match, exactly as it would have
+consulted `routed_by_assignment`. Every other adapter (Bindle, GitHub, GitLab, Jira, Local) leaves the field
+at its default `true` — verified none of them has an independent, post-dispatch-relevant continuation-
+revoking fact beyond ordinary terminal-state transition (GitHub: an issue cannot become a PR mid-run; GitLab/
+Local: `dispatchable` is an unconditional constant; Jira: `dispatchable?/4`'s blocker-terminality half is
+inert once dispatched, same reasoning as `002-bindle-integration` research.md R11; Bindle: `dispatchable`'s
+only continuation-relevant behavior is the claim-induced flip R11/FR-017 already handles generically, and a
+real terminal-state transition is already caught by `status` mapping straight onto `state`).
+
+**Rationale**: A provider-neutral name and a verified-correct Asana population are both required for this
+field to actually satisfy `002-bindle-integration` FR-017's per-adapter compatibility requirement, not just
+appear to. Naming it after Linear's own mechanism (`routed_by_assignment`) while asserting-without-verifying
+that Asana needs nothing is exactly the kind of unverified claim that produces a silent regression once a
+real deployment hits it.
+
+**Alternatives considered**: Computing each adapter's continuation-revoking check independently inside
+`Orchestrator`/`AgentRunner` by comparing raw `Issue` fields (`assignee_id`, `state`) against configured
+settings at continuation time — rejected: neither `assignee_id` nor `state` alone carries the adapter-specific
+matching rule (Linear's own assignee-filter semantics, Asana's own `completed` flag, which isn't projected
+onto any existing `Issue` field at all), and reimplementing per-adapter rules outside the adapter that
+already computes them correctly risks exactly the kind of drift Constitution II warns against. Keeping
+`routed_by_assignment`'s name but also populating it from Asana's `completed` flag — rejected: the field's
+own documented semantics ("no assignment concept") would then be self-contradictory for Asana's population,
+confusing to a future adapter author, and wrong to generalize from for a hypothetical future provider whose
+continuation-revoking signal is neither assignment- nor Asana's-completion-shaped.
 
 ## R10: Config schema for `tracker.kind: bindle`
 
@@ -405,3 +461,215 @@ common-case evidence above showed a safe, correct default exists; requiring conf
 integration`'s own Constitution V ("avoid unnecessary abstraction"/unnecessary required configuration)
 argues against when a correct default is available. Defaulting the projection path independently of
 `repo_path` (the first draft's choice) — rejected per the accidental-divergence risk above.
+
+## R16: Fresh-admission vs. continuation-retry acquisition gating (new, second correction pass)
+
+**Finding**: Traced directly against `orchestrator.ex`'s actual control flow (not assumed), the fresh-dispatch
+path and the retry-continuation path converge on the same two functions: `refresh_issue_for_dispatch/1`
+(which calls `revalidate_issue_for_dispatch/3`, which calls `retry_candidate_issue?/2`) and, immediately
+after, `do_dispatch_issue/4` → `spawn_issue_on_worker_host/5` (R6's acquisition call site). Fresh dispatch
+reaches them via `dispatch_issue/4`; retry-continuation reaches them via `handle_active_retry/4` — literally
+the same functions, not merely structurally similar ones. `candidate_issue?/3` (the fresh-admission-only
+predicate, gated on `dispatchable`) is used only in `should_dispatch_issue?/4`, never in the retry path;
+`retry_candidate_issue?/2` is the retry path's own, separate re-validation predicate — but nothing in
+today's code, or in this feature's first-draft design, gives `retry_candidate_issue?/2` different behavior
+depending on whether the issue is a genuinely fresh admission (e.g., following R12's spawn-failure
+compensation release) or a continuation of an issue Symphony already holds a claim for (an ordinary
+crash-mid-run retry, R7).
+
+This matters once `acquire_issue/2` exists: for a continuation retry, Symphony's claim is still held (R7 —
+`release_issue/2` is deliberately not called for this case), so the Bindle projection reports `dispatchable:
+false` for that task (data-model.md §2). If `retry_candidate_issue?/2` still requires `dispatchable = true`
+(as it effectively does today, sharing logic with the admission predicate), the retry is rejected before it
+ever reaches the acquisition call site — a real regression this feature's admission/continuation split
+(FR-013–FR-015) does not, by itself, fix, because `retry_candidate_issue?/2`'s re-validation is a distinct
+code path from `Orchestrator.reconcile_issue_state/4`'s continuation check. Even supposing re-validation were
+fixed, the acquisition call site itself (`spawn_issue_on_worker_host/5`) would then call `acquire_issue/2`
+unconditionally — and Bindle's `work_item_claims` primary key is `work_item_id` alone (verified,
+`work_ledger.py:1163-1169`), so a second `claim()` against a task this same owner already holds is rejected
+(`already_claimed`), not a no-op. Either failure mode permanently starves the retry.
+
+**Decision**: Both the re-validation predicate and the acquisition call site MUST branch on whether the issue
+is already present in `state.claimed`:
+
+- **Fresh admission** (issue not in `state.claimed`): re-validation requires `dispatchable = true` exactly as
+  today; `spawn_issue_on_worker_host/5` calls `acquire_issue/2` and only proceeds to spawn on success — R6's
+  original description, unchanged for this mode.
+- **Continuation retry** (issue already in `state.claimed`, because a prior worker for it actually started):
+  re-validation MUST NOT require `dispatchable = true` — it uses only the continuation/routing concern
+  (`routed?/2`, FR-013) plus the existing terminal/active/missing-from-tracker checks, the same ones ordinary
+  reconciliation (FR-014/FR-015) already uses. `spawn_issue_on_worker_host/5` MUST NOT call `acquire_issue/2`
+  for this mode — it proceeds directly to `Task.Supervisor.start_child/2`, reusing the already-held claim.
+
+This composes correctly with R12's spawn-failure compensation: since that compensation releases the claim
+and never sets `state.claimed` (`spawn_issue_on_worker_host/5`'s `{:error, reason}` branch never touches
+`state.claimed`, verified directly), the resulting retry is naturally a fresh-admission retry under this
+same `state.claimed`-membership test — no separate signal is needed to distinguish it from an ordinary
+crash-mid-run retry.
+
+**Rationale**: This is the same category of correction as `002-bindle-integration` research.md R11 — a
+genuine, verified defect that only manifests once a durable-claim-aware tracker (Bindle) makes a retry's
+own re-admission interact with Symphony's own held claim state, discovered by tracing actual control flow
+rather than assuming the fresh/retry distinction FR-016 already drew for `candidate_issue?/3` automatically
+extends to `retry_candidate_issue?/2` and the acquisition call site. `state.claimed` membership is the
+correct, already-available signal to branch on — it already means exactly "a prior worker for this issue
+actually started," which is precisely fresh-admission-vs-continuation's real distinction.
+
+**Alternatives considered**: Adding a new, separate boolean/flag threaded through the retry scheduling
+message to mark "this retry already holds a claim" — rejected: `state.claimed` already carries exactly this
+fact; a parallel flag would be new state duplicating an existing one, the kind of unnecessary abstraction
+Constitution V warns against. Always calling `acquire_issue/2` and treating `already_claimed` as a
+recoverable, non-fatal result meaning "proceed anyway" — rejected: this would make the orchestrator
+silently paper over a failed acquisition call by assuming a specific error reason means "it's fine, it's
+mine," which is fragile (it can't actually distinguish "already claimed by me" from "already claimed by a
+different, unrelated owner" without a further round-trip) and unnecessary when the branch can be made
+correctly up front using state Symphony already has.
+
+## R17: Restoring the agent-invoked task-completion tool (new, second correction pass)
+
+**Finding**: This feature's first correction pass removed the first draft's `done`-tool design entirely,
+reasoning from `002-bindle-integration` User Study 5's then-current wording ("semantic completion... MUST
+remain human-resolved") that any agent-invoked completion capability crossed that boundary. `002-bindle-
+integration`'s own second correction pass (that spec's research.md R16) found this reading overbroad:
+Bindle's actual model (`specs/002-milestone-task-work-items/spec.md`, `docs/DECISIONS.md` D038) draws a hard
+line between `type = 'task'` reaching `done` (mechanical, explicitly not a human-review event) and
+`type = 'milestone'` reaching `accepted` (the actual semantic judgment) — and `002-bindle-integration` FR-013
+now explicitly authorizes an agent's own bound-task `done` request through the existing FR-009 tracker-write
+boundary. This feature's removal of the tool was therefore not required by the (corrected) architecture
+contract; it was an overcorrection based on the contract's own prior overbroad wording.
+
+**Decision**: Restore one narrow, agent-invoked tool, `SymphonyElixir.Bindle.AgentTool`, exposed through the
+Bindle adapter's `agent_tool_specs/0`/`execute_agent_tool/3` implementation (spec.md FR-025/FR-026):
+
+- Exactly one tool, marking the session's own bound Bindle task `done`.
+- The target task id is resolved exclusively from `opts[:issue].id` — the session-bound `Tracker.Issue`
+  `SymphonyElixir.ClaudeCode.MCPServer` fixes at `start_link/1` time and passes into every
+  `execute_agent_tool/3` call, verified directly (`claude_code/mcp_server.ex:54,59,163-171`) to be the one
+  and only source of the current session's issue, never read from a model-supplied tool argument. This
+  mirrors `local_tracker_set_state`'s existing scope-restriction pattern exactly.
+- Implementation calls `SymphonyElixir.Bindle.Cli.done/3` (`bindle work done <id>`, no `--owner` argument —
+  R4's owner identity is not used here, since Bindle's `done` write surface has no ownership/claim
+  requirement, verified `contracts/task-write-surface.md`), then, on success, `Cli.publish/2` (R18).
+- No milestone, evidence, or dependency-graph operation is exposed, wrapped, or reachable from this tool —
+  it has exactly one code path, and that path only ever constructs a `bindle work done`/`publish` command
+  line for the one session-bound task id.
+
+**Rationale**: This restores real, demonstrated value (an agent's own bound task completion becoming visible
+to Bindle, and eventually to any human reviewing milestone readiness) without reopening any part of
+`002-bindle-integration`'s boundary this feature's first correction pass correctly protected — milestone
+acceptance, evidence, dependency/blocking reconstruction, and any orchestrator-owned lifecycle-write API
+remain exactly as forbidden as the first correction pass left them (FR-018/FR-019/FR-023). The tool's session-
+only scoping is what makes it safe to restore: it cannot be pointed at any task beyond the one Symphony
+itself bound the session to, so a coding agent's tool-call arguments (which an untrusted model process
+ultimately generates) have no path to naming an arbitrary target.
+
+**Alternatives considered**: Leaving the tool removed and treating agent-triggered task completion as
+permanently out of scope — rejected: this was the first correction pass's position, now shown to rest on an
+overbroad reading of a since-corrected upstream contract; leaving it removed would mean this feature
+implements a stricter rule than `002-bindle-integration` itself now requires, for no benefit. Allowing the
+tool to accept a model-supplied task id (with server-side validation that it matches the session's bound
+issue) — rejected: strictly more code and a strictly larger attack surface than simply never reading a
+model-supplied id in the first place; the session-bound `opts[:issue]` is already authoritative and
+sufficient.
+
+## R18: Projection refresh after agent-triggered `done` (new, second correction pass)
+
+**Finding**: Bindle's `bindle work publish` (verified `src/bindle/cli.py`, `symphony_projection.py`) is a
+fully separate, manually-triggered command that regenerates the published `task_projection` table in one
+atomic transaction. None of `bindle work done`/`claim`/`release`'s CLI subcommand implementations call
+`publish()` internally, and `done`'s `argparse` subparser accepts no `--publish` flag or equivalent hook —
+confirmed by direct inspection finding no cross-call between the `_cmd_work_*` handlers and `publish()`.
+This means that, absent this feature doing something about it, a task an agent marks `done` via R17's tool
+would leave the published projection reporting that task's stale prior `status` until *some* future
+`bindle work publish` happens to run — which, on Bindle's current design, requires an external, undocumented
+manual step, exactly the gap the task's own instructions flagged as load-bearing once R17's tool exists.
+
+Separately, claim/release correctness does **not** depend on the projection's freshness at all: Bindle's
+claim arbitration is a durable, atomic `INSERT`/`DELETE` against `work_item_claims`, entirely independent of
+`generate_external_projection()`'s own read path (verified: neither `claim()` nor `release_claim()` touches
+the projection artifact or calls `publish()`). The projection's staleness only affects what an *external*
+reader (Symphony's own polling, or a human/dashboard) currently sees — never whether a concurrent claim
+attempt is correctly arbitrated.
+
+**Decision**: Only the task-completion tool (R17) triggers a publish, immediately after a successful `done`:
+`SymphonyElixir.Bindle.Cli.publish/2` invokes `bindle work publish` (also no `--owner` argument — verified
+`publish` takes none either) right after `done/3` returns success. The orchestrator-owned claim/release seam
+(`acquire_issue/2`/`release_issue/2`) does **not** call `publish` — there is no demonstrated correctness need
+for one, per the independence finding above, and adding one at every claim/release would be an unjustified
+subprocess-call addition (Constitution V) with no requirement behind it.
+
+**Failure semantics**: if `done` succeeds and the subsequent `publish` fails, the tool's result MUST
+distinguish the two: the `done` transition is authoritative and already succeeded in Bindle's own ledger —
+it MUST NOT be retried, because Bindle's `mark_done()` guard (`status = 'open'`) would reject a second call
+with `not_open`, a confusing, spurious failure for a mutation that already genuinely succeeded (this is
+*not* the same as `claim`'s idempotent-safe-reject semantics being harmless to retry — retrying `done` here
+would misreport a real success as a failure). The `publish` failure is logged and surfaced distinctly (e.g.
+as part of the tool's own result payload, not folded into an overall failure) — this feature does not add
+automatic retry-until-success `publish` logic beyond this one best-effort attempt; a projection that
+remains stale until the next successful publish (an operator's own `bindle work publish` cadence, or this
+same task's own next Symphony-initiated mutation, if any) is an accepted, explicitly-documented limitation.
+
+**Rationale**: This is the smallest mechanism that makes the task's own guidance ("after a successful
+Symphony-initiated Bindle lifecycle mutation such as `done`, invoke Bindle's own supported `bindle work
+publish` command") concrete against Bindle's actual, verified CLI contract, while explicitly declining to
+extend the same treatment to claim/release, where grounding shows it would add cost without a correctness
+benefit.
+
+**Alternatives considered**: Publishing after every claim/release as well, for symmetry — rejected per the
+independence finding above; symmetry is not itself a requirement when the two writes have genuinely
+different correctness dependencies on projection freshness. Retrying `done` if `publish` fails, treating the
+pair as one logical transaction — rejected: `done` and `publish` are not atomic together on Bindle's side (no
+such combined operation exists), and retrying `done` specifically would produce a spurious `not_open`
+failure for what is actually a fully successful task completion, misleading whoever reads the result.
+Adding a bounded retry loop around `publish` itself — rejected as unnecessary scope beyond what the task's
+own instructions asked to investigate; a single best-effort attempt with distinct failure surfacing is the
+smallest mechanism satisfying the visibility goal without inventing new retry infrastructure this feature
+has no other need for.
+
+## R19: Startup-reconciliation liveness — bounded per-id retry using existing scheduling infrastructure (new, second correction pass)
+
+**Finding**: The corrected startup-time reconciliation sweep (data-model.md §6, R5) enumerates every
+projected task id and attempts an owner-scoped release for each, continuing past an individual failure
+rather than aborting the whole sweep. This correctly avoids blocking recovery of *other*, healthy tasks on
+one bad release — but, as originally described, a task whose release failed (e.g. a transient `bindle` CLI
+hiccup at that exact moment) would receive no further attempt until the next full Symphony process restart,
+which the task's own instructions correctly flag as an unacceptable "recovered without manual intervention"
+claim if that is the only retry path.
+
+**Decision (chosen shape: bounded retry, not fail-startup)**: Reuse the orchestrator's existing issue-retry
+timer/backoff primitive (`schedule_issue_retry/4`'s underlying scheduling mechanism) rather than building a
+new one. For any id whose release fails during the initial sweep, schedule a small, bounded number of
+follow-up release-only retry attempts for exactly that id (not the whole sweep), using the same timer
+primitive. Normal polling begins immediately after the initial sweep pass completes, regardless of whether
+any individual release is still pending a follow-up retry — an unrecovered stale claim for one task must
+not block dispatch of every other, unrelated dispatchable task. If the bounded retry budget is exhausted
+without success, log a persistent, operator-visible failure naming the specific task id; do not silently
+drop it, and do not claim it was recovered.
+
+**Rationale (why bounded retry over "fail startup entirely")**: The task's own instructions offer two
+shapes: fail startup if any release fails (so polling never begins with a known-unrecovered claim), or a
+bounded retry. Failing startup entirely was rejected because it makes the *entire deployment's* liveness
+hostage to a single stale claim or a single transient `bindle` CLI failure — a Symphony process that cannot
+start at all provides zero service for every other, unrelated dispatchable task, which is a worse outcome
+than the narrower one (a single task's claim staying stuck a little longer while everything else proceeds
+normally). A bounded retry reusing existing infrastructure recovers the common case (a transient failure)
+without an operator restart, while still surfacing a persistent, operator-visible failure — not silently
+declared solved — if the bound is exhausted, honestly documenting the residual gap (a specific stuck claim
+that then needs a manual `bindle work release`/operator restart) rather than either hiding it or blocking
+the whole deployment on it.
+
+**Explicitly accepted trade-off**: A small window remains where a specific task's stale claim needs manual
+intervention if the bounded retry budget is exhausted — this feature does not claim otherwise. This is
+judged the better trade-off than either silently leaving it unretried until restart (the original gap) or
+blocking all polling on it (the fail-startup alternative), and is surfaced loudly (persistent log entry
+naming the task id) rather than assumed away.
+
+**Alternatives considered**: Fail startup entirely on any release failure — rejected per the liveness
+reasoning above. A new, dedicated retry-scheduling mechanism for stale-claim releases, separate from
+`schedule_issue_retry/4`'s existing primitive — rejected: unnecessary duplication (Constitution V) when the
+existing timer/backoff mechanism already does exactly what's needed (schedule a bounded, backed-off retry
+for one identified unit of work). Reintroducing a local claims ledger to track "still needs retry" state
+across restarts — rejected: explicitly out of scope per R5's own crash-unsafety finding and this feature's
+Assumptions; the bounded retry here is in-memory, scoped to the current process's own startup sequence, and
+does not need to survive a further restart (a further restart simply re-runs the full sweep from scratch,
+which is already safe per R5).

@@ -77,6 +77,18 @@ Its validation therefore splits into two parts: what can be checked **now**, by 
    fixed; **it is expected to still show the unmodified, pre-FR-017 behavior** until that future feature
    lands the correction research.md R11 describes.
 
+### Scenario F: FR-013 distinguishes task `done` from milestone `accepted` (User Story 5, FR-013, research.md R16)
+
+1. Read `specs/002-bindle-integration/spec.md` FR-013 and User Story 5's Acceptance Scenarios.
+2. Cross-check against Bindle's own current model: `~/Developer/bindle/specs/002-milestone-task-work-items/spec.md`
+   User Story 2 ("A task reaches 'done' without triggering human review") and `docs/DECISIONS.md` D038
+   ("Readiness is mechanical; acceptance is semantic").
+3. **Expected outcome**: FR-013 permits an agent working its own bound Bindle task to explicitly request that
+   task's `done` transition through the existing FR-009 tracker-write boundary, while continuing to forbid
+   Symphony or any agent it hosts from ever inferring semantic correctness/completeness from mechanical
+   evidence, or from marking a milestone `accepted` — confirming the specification's wording no longer reads
+   as forbidding a capability Bindle's own model treats as safely agent-triggerable.
+
 ## Part 2 — Validate once a Bindle-backed adapter is actually implemented (future feature, out of scope here)
 
 These scenarios cannot be run today because no concrete Bindle-backed adapter exists in or alongside this

@@ -500,3 +500,54 @@ is harmless — rejected: contradicted directly by `linear/client.ex:497`'s `ass
 real, currently-shipped, adapter-observable behavior) and by `asana/client.ex:207,223`'s independent
 `state`/`dispatchable` fields (a real, structurally-possible gap this document cannot responsibly certify
 closed without knowing a given deployment's own state configuration).
+
+## R16 — FR-013 correction: task `done` (mechanical, agent-triggerable) vs. milestone `accepted` (semantic, human-only) (new, 2026-08-27 correction pass)
+
+**Finding**: This specification's original FR-013 ("Semantic completion or correctness judgment for
+Bindle-managed work MUST remain human-resolved... Neither this specification nor any future implementation
+of it MUST introduce automated semantic-completion inference as a substitute for that human judgment") was
+overbroad. Re-verified directly against Bindle's current `specs/002-milestone-task-work-items/spec.md`,
+`docs/DECISIONS.md` D038, and `src/bindle/work_ledger.py`: Bindle's own model draws a hard line this
+specification's prior wording did not — `type = 'task'` (an execution unit) reaching `done` is explicitly
+*not* a semantic-judgment event (`specs/002-milestone-task-work-items/spec.md`'s User Story 2 title: "A task
+reaches 'done' **without triggering human review**"; body: "it must not, by itself, require or trigger a
+human semantic judgment"), while `type = 'milestone'` (a human-acceptance grouping unit) reaching `accepted`
+is exactly that semantic judgment, and only that transition. D038 states this in one sentence: "Readiness is
+mechanical; acceptance is semantic... the ledger never automates or infers [acceptance] from readiness
+alone."
+
+Concretely, `mark_done()` (`work_ledger.py:986-1007`) is a single guarded `UPDATE ... WHERE id=? AND
+status='open'` — no claim/ownership check, no evidence requirement, no cascade to any parent milestone row.
+The `bindle work done <id>` CLI (`contracts/task-write-surface.md`, `symphony_projection.py`'s
+`complete_task()`) takes no `--owner` argument, categorically rejects a milestone id (`not_a_task`) rather
+than silently treating it as one, and rejects a second call on an already-done task with an explicit
+`not_open` failure (not a silent no-op, not a crash). Milestone acceptance, by contrast, only ever happens
+via an explicit `review → accepted` transition (`accept_milestone()`), reachable only after `mark_in_review()`
+(itself gated on `is_review_ready()`, a purely mechanical, derived fact) — and Bindle's ledger never performs
+that final `review → accepted` step itself.
+
+**Decision**: Narrow FR-013 to state the distinction explicitly: Symphony MUST NOT infer semantic
+correctness/completeness or automatically mark a Bindle item `done`/`accepted` from mechanical evidence
+alone, but an agent working its own bound Bindle *task* MAY explicitly request that task's own `done`
+transition through the existing FR-009 agent-invoked, host-executed tracker-write boundary — this is not new
+authorization, only a clarification that this specific, narrowly-scoped mutation is one instance of what
+FR-009 already generically permits. Milestone `accepted` remains categorically out of reach for Symphony or
+any agent it hosts, resolved only within Bindle (or upstream of it) by a human.
+
+**Rationale**: The original FR-013 wording, applied literally, would have forbidden the one lifecycle write
+Bindle's own model explicitly designed to be agent-safe (task `done`) — a stricter rule than Bindle's own
+authoritative source of truth for its own model draws. This is not a reopening of this specification's
+architecture (Bindle still owns all mechanical evidence verification, FR-012; Symphony still infers nothing;
+milestone acceptance is still exclusively human) — it is a correction of an overbroad restatement that,
+followed literally, would have prevented the eventual `003-bindle-tracker-adapter` implementation feature
+from restoring a narrow, already-FR-009-authorized task-completion tool without appearing to contradict this
+frozen contract.
+
+**Alternatives considered**: Leaving FR-013 as originally worded and requiring `003-bindle-tracker-adapter`
+to interpret "semantic completion" narrowly enough to permit task `done` on its own — rejected: this
+specification is supposed to be the authoritative, frozen boundary contract; leaving an ambiguity for a
+downstream implementation feature to resolve by its own interpretation is exactly the kind of drift this
+correction pass exists to prevent. Extending FR-013's human-only rule to cover task `done` as well (i.e.
+forbidding the agent tool entirely) — rejected: contradicted directly by Bindle's own model, which treats
+task `done` as intentionally, explicitly not a human-review event; forbidding it here would misrepresent
+Bindle's own authoritative lifecycle semantics rather than defer to them.

@@ -11,6 +11,14 @@ signature no longer accepts `--worktree`/`--branch` (research.md R6); `release_i
 compensation (§3) and startup reconciliation (§7). See `research.md` R4–R7, R12–R15 for the full grounding
 behind each change.
 
+**Second correction pass (2026-08-27, same day)**: after `002-bindle-integration` FR-013's correction (task
+`done` vs. milestone `accepted`) and further Symphony-runtime grounding, this contract restores a narrow
+agent-invoked task-completion tool (new §9, research.md R17), adds `done`/`publish` to the CLI wrapper (§4,
+research.md R18) — used only by §9, never by the acquire/release seam — corrects §2's acquisition call site
+to fire only in fresh-admission mode (research.md R16), and adds bounded per-id retry to §7's startup
+reconciliation (research.md R19). None of these reopen `002-bindle-integration`; each makes this feature
+conform to its FR-013 correction and to newly-verified runtime facts more closely, not less.
+
 ## 1. `Tracker` behaviour addition
 
 ```elixir
@@ -33,12 +41,24 @@ always genuinely available at its one call site.
 
 ## 2. Orchestrator call sites (single call site per release event)
 
-- **Acquire**: `Orchestrator.spawn_issue_on_worker_host/5`, immediately before
-  `Task.Supervisor.start_child/2`. Calls `bindle work claim <id> --owner <owner>` with **no**
-  `--worktree`/`--branch` argument (§3 of `symphony-projection-v1.md`'s sibling contract; research.md R6).
-  On `:ok`, proceed to spawn exactly as today. On `{:error, _}`, log at `Logger.debug` (matching the
-  existing no-worker-capacity log level) and return `state` unchanged — the issue is simply not dispatched
-  this cycle, and remains a candidate on the next poll.
+- **Acquire — fresh-admission mode only** (corrected, second pass — research.md R16): `Orchestrator.
+  spawn_issue_on_worker_host/5`, immediately before `Task.Supervisor.start_child/2`, calls `acquire_issue/2`
+  **only when the issue's id is not already present in `state.claimed`**. Calls `bindle work claim <id>
+  --owner <owner>` with **no** `--worktree`/`--branch` argument (§3 of `symphony-projection-v1.md`'s sibling
+  contract; research.md R6). On `:ok`, proceed to spawn exactly as today. On `{:error, _}`, log at
+  `Logger.debug` (matching the existing no-worker-capacity log level) and return `state` unchanged — the
+  issue is simply not dispatched this cycle, and remains a candidate on the next poll. **When the issue's id
+  IS already present in `state.claimed`** (a continuation retry, §9a's data-model.md entry) — `spawn_issue_
+  on_worker_host/5` MUST NOT call `acquire_issue/2` at all; it proceeds directly to `Task.Supervisor.
+  start_child/2`, reusing the already-held claim. This branch is required, not optional: `work_item_claims`'
+  primary key is `work_item_id` alone, so a second `claim()` against an already-claimed task is rejected
+  even from the same owner.
+- **Re-validation before dispatch — same fresh-admission/continuation-retry split** (corrected, second pass
+  — research.md R16): `Orchestrator.retry_candidate_issue?/2` (reached via `revalidate_issue_for_dispatch/3`
+  → `refresh_issue_for_dispatch/1`, the exact function shared by both `dispatch_issue/4` and `handle_active_
+  retry/4`) MUST require `dispatchable = true` only when the issue's id is not already in `state.claimed`;
+  for an issue already in `state.claimed`, it MUST use `Issue.routed?/2` (label match + `continuation_
+  allowed`, data-model.md §4) plus the existing terminal/active/missing-from-tracker checks instead.
 - **Release — single call site**: `Tracker.release_issue/2` is invoked from exactly one internal function,
   `Orchestrator.release_issue_claim/2`, reached from every release path:
   - `terminate_running_issue/3`'s `nil` and catch-all branches already call `release_issue_claim/2` today
@@ -88,12 +108,19 @@ complete no-op for every adapter not implementing the callback pair, consistent 
   are documented as optional on Bindle's side (`task-write-surface.md`), so omitting them is a fully
   supported call shape, not a partial one.
 - `release/4` invokes `bindle work release <id> --owner <owner>` with `cd: repo_path`.
-- **`bindle work done` is not wrapped by this feature.** It exists in Bindle's own supported write
-  surface, but this feature has no requirement that needs it (spec.md FR-018/FR-019, User Story 5) — a
-  Bindle-managed task's completion remains reachable only through Bindle's own supported external
-  interfaces, never through Symphony. If a future feature is proposed to expose completion through
-  Symphony, it must be designed and reviewed against `002-bindle-integration` User Story 5's
-  semantic-judgment boundary at that time, not assumed as a natural extension of this contract.
+- **`done/3` and `publish/2` (restored, second correction pass — research.md R17/R18)**:
+  ```elixir
+  @spec done(repo_path :: String.t(), bindle_bin :: String.t(), id :: String.t()) ::
+          {:ok, String.t()} | {:error, term()}
+  @spec publish(repo_path :: String.t(), bindle_bin :: String.t()) ::
+          {:ok, String.t()} | {:error, term()}
+  ```
+  `done/3` invokes `bindle work done <id>` with `cd: repo_path` — **no `--owner` argument**: Bindle's `done`
+  write surface has no ownership/claim requirement (verified `contracts/task-write-surface.md`/
+  `symphony_projection.py`'s `complete_task()`). `publish/2` invokes `bindle work publish` with `cd:
+  repo_path` — also no `--owner` argument. **Both are called only from `SymphonyElixir.Bindle.AgentTool`
+  (§9 below) — never from `acquire_issue/2`/`release_issue/2` or any other orchestrator-owned code path**;
+  the claim/release seam remains scoped exclusively to `claim`/`release` (FR-018).
 - Exit code `0` → `{:ok, output}`. Exit code non-zero → `{:error, {:bindle_cli_failed, exit_code,
   output}}`, where `output` is stderr+stdout combined (`stderr_to_stdout: true`) so the `bindle work
   <verb>: <reason>` message is captured for logging without the caller needing to parse it further.
@@ -155,11 +182,18 @@ Runs once at Symphony startup, before normal polling begins, only when `tracker.
    an ordinary poll failure would — reconciliation MUST NOT silently skip recovery or silently proceed.
 3. For each id returned, call `Bindle.Cli.release/4` (§4) with the persisted owner identity. Every call is
    attempted regardless of any individual call's own success/failure — a per-task release failure is
-   logged and does not abort the sweep for the remaining ids (an unrecovered stale claim here is no worse
-   than before this feature existed, and will be retried on the next startup).
+   logged and does not abort the sweep for the remaining ids.
 4. This is a blind, projection-wide sweep with **no local record of which tasks this deployment previously
    claimed** — Bindle's own safe-release guarantee (releasing a task not held by this owner is a no-op)
    makes such a record unnecessary (data-model.md §6, research.md R5).
+5. **Bounded per-id retry on individual failure (corrected, second pass — research.md R19)**: an id whose
+   release call fails in step 3 is not left unretried until the next full process restart. Schedule a
+   bounded number of follow-up release-only retries for exactly that id, reusing the orchestrator's
+   existing `schedule_issue_retry/4` timer/backoff primitive — no new scheduling mechanism, no local ledger.
+   Normal polling begins immediately after step 3 completes and is not blocked by these follow-up retries.
+   If the bounded budget is exhausted without success, log a persistent, operator-visible failure naming
+   the specific task id — this contract MUST NOT be read as claiming such a case is "recovered without
+   manual intervention."
 
 ## 8. Config validation contract
 
@@ -176,3 +210,29 @@ Runs once at Symphony startup, before normal polling begins, only when `tracker.
 This mirrors `Local.Adapter.validate_config/1`'s existing validate-then-delegate shape, with the
 correction that neither `repo_path` nor the projection `path` is treated as a required-with-no-default
 field now that both have a well-grounded default (research.md R15).
+
+## 9. Agent-invoked task-completion tool (restored, second correction pass — `SymphonyElixir.Bindle.AgentTool`, research.md R17/R18)
+
+```elixir
+@spec tool_specs() :: [map()]
+@spec execute(tool :: String.t(), arguments :: map(), opts :: keyword()) :: map()
+```
+
+- Exposed through `SymphonyElixir.Bindle.Adapter`'s `agent_tool_specs/0`/`execute_agent_tool/3`
+  implementation, exactly one tool spec, mirroring the shape every other provider's `AgentTool` module
+  already uses (e.g. `linear/agent_tool.ex`).
+- **Target resolution**: the implementation MUST read the target task id exclusively from
+  `Keyword.fetch!(opts, :issue).id` — the session-bound `Tracker.Issue` `SymphonyElixir.ClaudeCode.MCPServer`
+  fixes at that listener's `start_link/1` time and passes into every `execute_agent_tool/3` call. The tool's
+  `inputSchema` MUST NOT declare a task-id parameter at all — there is nothing for a model-supplied argument
+  to override, by construction, not merely by server-side validation.
+- **Behavior**: calls `Bindle.Cli.done/3` (§4) for the resolved id. On success, calls `Bindle.Cli.publish/2`
+  (§4) as a best-effort follow-up. Returns a result distinguishing three outcomes: `done` failed (the tool's
+  own failure result, e.g. `{:error, {:bindle_cli_failed, _, _}}` or `not_open`); `done` succeeded and
+  `publish` succeeded (ordinary success); `done` succeeded but `publish` failed (success for the completion
+  itself, with the publish failure surfaced as a distinct field in the result payload — never re-attempted
+  by retrying `done`, per §4's rationale).
+- **What this tool does not do**: it does not infer completion from any mechanical signal (test results,
+  process exit, evidence) — it fires only in direct response to the agent's own explicit tool invocation; it
+  exposes no milestone review/acceptance operation; it reads no dependency/blocking/evidence state; it
+  shares no code path with `acquire_issue/2`/`release_issue/2` beyond the `Bindle.Cli` wrapper module.
