@@ -180,10 +180,15 @@ fact above is advisory only and MUST NOT be treated as sufficient proof of acqui
 - The acquisition/release calls above are a separate, orchestrator-owned category of write, narrowly scoped
   to claim/release operations only (spec FR-016) — this is a deliberate, bounded carve-out from "no new
   orchestrator-owned tracker-write API," not a silent contradiction of it.
-- **Bindle currently exposes zero external write surface** (no CLI/RPC) for either lifecycle mutation or
-  claim/release, verified directly against `~/Developer/bindle`. This remains an external Bindle-side
-  dependency this contract cannot resolve — it now covers three write-shaped obligations (lifecycle write,
-  claim, release) instead of one.
+- **Bindle now exposes a narrow, supported external write surface for claim/release/done** — re-verified
+  2026-08-27 against `~/Developer/bindle` HEAD `d70bc30` (`docs/DECISIONS.md` D039): `claim_task()` /
+  `release_task()` / `complete_task()` (library, `src/bindle/symphony_projection.py`) and their
+  `bindle work claim` / `release` / `done` CLI equivalents, each a thin wrapper over the ledger's own
+  atomic `claim()` / `release_claim()` / `mark_done()` primitives, rejecting a milestone id distinctly
+  rather than silently treating it as a task. No general-purpose lifecycle-mutation write beyond these
+  three operations exists — this contract's FR-009 lifecycle-write obligation and FR-016's narrower
+  claim/release exception both remain correctly scoped: a future Bindle-backed adapter's read of
+  "supported write path" now resolves to these three functions, not to an unresolved dependency.
 
 ## Failure-surface obligations (spec FR-007, FR-008, research.md R7)
 

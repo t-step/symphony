@@ -84,20 +84,21 @@ repository yet. They are recorded here so the eventual implementation feature in
 scenarios instead of re-deriving them, mirroring how `001-local-tracker-multi-agent`'s own quickstart
 scenarios anchor its acceptance criteria.
 
-**Grounding note (reworked 2026-08-27)**: Bindle's own `WorkLedger.generate_projection()`
-(`~/Developer/bindle/src/bindle/work_ledger.py:1326`) is a real, tested method today, but it is Bindle's
-current *in-process* return value, not the published artifact this specification requires (FR-002) — Bindle
-has not yet built the physically separate, schema-versioned SQLite artifact this contract fixes (research.md
-R1), nor the `claim()`/`release_claim()` write surface a Symphony-side acquisition seam would call into. The
-eventual implementation feature's test double for Scenarios 1–2 below can still be built against Bindle's
-actual `WorkLedger`/schema knowledge (`work_items`, `work_item_claims`, `tests/test_work_ledger.py` in that
-repository), materialized into a small on-disk SQLite fixture matching data-model.md §1's column shape,
-rather than an invented shape — but building the projection artifact and the write surface for real is
-Bindle-side work this specification requires without itself performing.
+**Grounding note (re-verified 2026-08-27, cross-repo reconciliation pass)**: Bindle now publishes the
+projection artifact and write surface this contract requires — `~/Developer/bindle` HEAD `d70bc30`,
+`docs/DECISIONS.md` D039: `src/bindle/symphony_projection.py`'s `publish()` writes the physically separate,
+schema-versioned SQLite artifact (`contracts/symphony-projection-v1.md` in that repository) FR-002 requires,
+and `claim_task()`/`release_task()`/`complete_task()` provide the write surface a Symphony-side acquisition
+seam would call into. This corrects the prior grounding note (checked against an earlier Bindle HEAD,
+`3dddedb`, before D039 landed), which found these not yet built. The eventual implementation feature's test
+fixtures for Scenarios 1–2 below can now be built against a real published artifact and real write surface,
+not only a test double — though the Bindle-backed `Tracker` adapter itself remains unbuilt in this
+repository, so these scenarios still cannot be run end-to-end until that adapter exists.
 
 1. **End-to-end dispatch through a Bindle-backed tracker**: configure a deployment with the future
-   `tracker.kind` value (research.md R4) pointing at a projection artifact (real, once Bindle builds it per
-   FR-002, or a test-double SQLite file matching data-model.md §1's exact column shape) containing one
+   `tracker.kind` value (research.md R4) pointing at a projection artifact (Bindle's own published
+   `symphony-projection.sqlite3`, or a test-double SQLite file matching data-model.md §1's exact column
+   shape) containing one
    `type = 'task'`, dispatchable work item; confirm Symphony polls, calls the acquisition callback (FR-015),
    dispatches, executes, and completes it exactly as it would for any other tracker (spec User Story 1,
    Acceptance Scenario 2).

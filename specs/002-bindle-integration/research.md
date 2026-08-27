@@ -13,6 +13,15 @@ actual implementation (`~/Developer/bindle`, HEAD `3dddedb`, `specs/001-durable-
 D037/D038) rather than left as pure speculation about an unbuilt system. Several previously open questions
 now have real evidence behind them instead of only plausible alternatives.
 
+**Re-verification (2026-08-27, later same day, cross-repo reconciliation pass)**: Bindle's own team landed
+`specs/003-symphony-task-integration/` after the grounding update above was written — HEAD is now `d70bc30`,
+`docs/DECISIONS.md` D039. R1's projection-transport decision and R2's coupling-risk analysis below turned out
+to describe exactly what Bindle built (a physically separate, versioned, read-only-by-contract SQLite file,
+`src/bindle/symphony_projection.py`'s `publish()`) — no correction needed to either. What changed is only
+which claims elsewhere in this feature's artifacts asserted the artifact and write surface did not exist yet
+(they now do); those are corrected in place at spec.md's Assumptions, quickstart.md's Part 2 grounding note,
+and `contracts/bindle-schedulable-projection.md`'s write-surface obligations, not here.
+
 **Rework (2026-08-27, later same day)**: A second pass corrected two conclusions from the grounding update
 above that turned out to be wrong calls, not merely refinements — R1's "favor a CLI-emitted artifact"
 leaning is **reversed** (see R1 below), and R9's "synthesize `state` from `(terminal, eligible)`" finding is
