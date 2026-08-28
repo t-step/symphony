@@ -240,22 +240,30 @@ considered complete.
   intermittently fail, unrelated to this feature — quickstart.md. **Result: 507 tests, 0 failures, 7 skipped
   (the 7 skipped are pre-existing `*_live_e2e_test.exs` files requiring live provider credentials —
   unrelated to this feature, unchanged skip count from before). Neither known-flaky test flaked this run.**
-- [~] T045 Execute quickstart.md's manual end-to-end proof against a real (or fixture) Bindle repository —
+- [X] T045 Execute quickstart.md's manual end-to-end proof against a real (or fixture) Bindle repository —
   SC-001 (poll, dispatch, and run a coding-agent session against a dispatchable Bindle task through the
   unmodified orchestrator/agent-runner path): dispatch, claim visibility, non-preemption, terminal release,
   spawn-failure compensation (fresh-admission retry), continuation-retry (no re-claim), crash-recovery
   startup sweep with bounded retry, and agent-triggered `done`+`publish` including a simulated
-  publish-failure-after-done case. **Partially fulfilled, honestly documented rather than fabricated**: no
-  `bindle` CLI or real Bindle repository is available in this environment (verified: `which bindle` →
-  not found) — the full manual proof against a *genuine* `bindle` binary's real command semantics
-  (actual `already_claimed`/`not_open` rejection text, actual `publish` behavior) could not be executed.
-  Every individual mechanism this proof would exercise IS verified, though — via `bindle_cli_test.exs`
-  against a real (fake, but genuinely executed — not `Application.env`-stubbed) shell-script binary
-  proving the actual `System.cmd/3`/`cd:`/exit-code integration, and via `bindle_orchestrator_integration_test.exs`
-  (16 tests) driving the real orchestrator functions end-to-end with an injected CLI stub for every
-  scenario the manual proof's steps name. This is real coverage of the same integration points, just not
-  proof against Bindle's own actual CLI binary. Flagged as a genuine, undischarged verification gap in the
-  final report rather than claimed complete.
+  publish-failure-after-done case. **Fully discharged (2026-08-27)** by an independent live cross-repo
+  proof against a real, editable-installed `bindle` binary — Bindle `main` @ `dace8f68`, Symphony
+  `development` @ `3aef417` — using a disposable real Bindle repository and no CLI mocking (calls were
+  only observed via a pass-through spy, never faked). Every quickstart.md scenario passed against real
+  ledger/projection SQLite state, independently confirmed via direct SQL: projection compatibility;
+  real claim arbitration including Bindle's genuine `already_claimed` rejection of a second claim;
+  continuation under a held claim (no re-claim, no premature release); release and fresh re-admission;
+  spawn-failure compensation (real compensating release, retry treated as fresh admission, not rejected);
+  agent-scoped `done` auto-followed by real `publish`, unblocking the downstream chained task; the
+  done-succeeds/publish-fails partial failure (no duplicate `done`; a later solo `publish` converges the
+  projection); and startup stale-claim recovery plus its dedicated bounded retry on an injected real
+  release failure, confirmed isolated from `state.retry_attempts`. Full suite: 511 tests, 0 unexpected
+  failures (only the two pre-existing, already-logged wall-clock flakes). No defects found in either
+  repository; no source changes were required.
+  **Residual verification boundaries** (properties of any point-in-time integration proof, not open
+  feature work): concurrent claims from multiple Symphony deployments against one Bindle repo were not
+  exercised; a real coding-agent session invoking `bindle_mark_task_done` mid-turn was not exercised
+  (only the tool's host-side execution path was — the part this feature owns); this proof is pinned to
+  Bindle `dace8f68` and does not cover a materially different future Bindle CLI release.
 
 ---
 
