@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Tracker do
 
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
+    "bindle" => SymphonyElixir.Bindle.Adapter,
     "github" => SymphonyElixir.GitHub.Adapter,
     "gitlab" => SymphonyElixir.GitLab.Adapter,
     "jira" => SymphonyElixir.Jira.Adapter,
@@ -26,10 +27,14 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback acquire_issue(Issue.t(), keyword()) :: :ok | {:error, term()}
+  @callback release_issue(issue_id :: String.t(), keyword()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
-                      validate_config: 1
+                      validate_config: 1,
+                      acquire_issue: 2,
+                      release_issue: 2
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -39,6 +44,36 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @doc """
+  Calls the active adapter's optional real-time acquisition seam, when it implements one (a
+  durable-claim-aware tracker such as Bindle). A complete no-op (`:ok`) for every adapter that does not
+  implement `acquire_issue/2` — the projection's own admission fact remains sufficient proof of eligibility
+  for those adapters.
+  """
+  @spec acquire_issue(Issue.t(), keyword()) :: :ok | {:error, term()}
+  def acquire_issue(%Issue{} = issue, opts \\ []) do
+    call_optional_seam(:acquire_issue, [issue, opts])
+  end
+
+  @doc """
+  Calls the active adapter's optional real-time release seam, when it implements one. A complete no-op
+  (`:ok`) for every adapter that does not implement `release_issue/2`.
+  """
+  @spec release_issue(String.t(), keyword()) :: :ok | {:error, term()}
+  def release_issue(issue_id, opts \\ []) when is_binary(issue_id) do
+    call_optional_seam(:release_issue, [issue_id, opts])
+  end
+
+  defp call_optional_seam(function, args) do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, function, length(args)) do
+      apply(adapter, function, args)
+    else
+      :ok
+    end
   end
 
   @doc """

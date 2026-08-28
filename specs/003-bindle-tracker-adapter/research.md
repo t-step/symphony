@@ -31,19 +31,26 @@ scheduling infrastructure.
 
 ## R1: Read-only SQLite access to the published projection
 
-**Decision**: Use the existing `exqlite` dependency (`mix.lock`, `~> 0.30`, resolving `0.40.0`), opening
-the projection with a read-only URI connection (`Exqlite.open(path, mode: :readonly)` /
-equivalent `file:<path>?mode=ro` URI form) rather than a plain file-path connection.
+**Decision**: Use the `exqlite` library (`~> 0.30`, resolving `0.40.0`), opening the projection via its
+low-level `Exqlite.Sqlite3.open/2` with `mode: :readonly` (the `SQLITE_OPEN_READONLY` C flag, verified
+against `exqlite`'s actual `Sqlite3.open/2` implementation — not a `file:<path>?mode=ro` URI string, which
+`exqlite`'s API does not require) rather than a plain read-write connection.
 
-**Rationale**: `exqlite` is already present in the project's dependency tree (confirmed in `mix.lock`
-before this feature adds anything), so FR-002's "opened exclusively via SQLite's own read-only open mode"
-requirement is satisfiable with zero new dependencies. A plain-path connection would open the file
-read-write by default and rely on the adapter simply "not issuing a write" — insufficient per FR-002,
-which requires the connection itself be opened read-only.
+**Correction (implementation-stage)**: this decision's original rationale claimed `exqlite` was "already
+present in the project's dependency tree" — verified directly against `elixir/mix.exs`/`mix.lock` during
+implementation that this was false; no SQLite library of any kind was present before this feature. `exqlite`
+is added here as a new dependency. The decision to use it (over shelling out to `sqlite3`) remains correct
+and is unaffected by this correction — it is simply the right library for the job, not a reuse of something
+already vendored.
+
+**Rationale**: `exqlite`'s low-level `Sqlite3` API satisfies FR-002's "opened exclusively via SQLite's own
+read-only open mode" requirement directly via its `mode: :readonly` open flag. A plain-path connection
+would open the file read-write by default and rely on the adapter simply "not issuing a write" —
+insufficient per FR-002, which requires the connection itself be opened read-only.
 
 **Alternatives considered**: Shelling out to the `sqlite3` CLI for reads — rejected: adds a second
-external-process dependency for no benefit when a proper read-only driver connection is available and
-already vendored.
+external-process dependency (on top of the `bindle` CLI this feature already shells out to) for no benefit
+when a proper read-only driver library is a single, well-maintained Hex dependency.
 
 ## R2: Schema-version validation
 

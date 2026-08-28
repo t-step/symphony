@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Config.Schema do
   @local_default_provider_path ".symphony/local_tracker.json"
   @local_active_states ["todo", "in_progress", "blocked"]
   @local_terminal_states ["done", "cancelled"]
+  @bindle_default_bin "bindle"
 
   @type t :: %__MODULE__{}
 
@@ -531,6 +532,19 @@ defmodule SymphonyElixir.Config.Schema do
       )
 
     {settings.tracker.api_key, settings.tracker.assignee, local_provider, []}
+  end
+
+  # `repo_path`, the projection `path` (resolved relative to `repo_path`, not independently), and
+  # `owner_id_path` all default relative to `Config.workflow_dir()` — a runtime value this
+  # settings-parse-time function does not have access to (mirroring `Local.Adapter.
+  # resolve_provider_path/2`'s separation: finalize_settings/2 fills only workflow-dir-independent
+  # defaults; `SymphonyElixir.Bindle.Adapter`'s own resolve_* functions apply the workflow-dir- and
+  # repo_path-relative defaults at call time, data-model.md §7, research.md R10/R15). `bindle_bin` has
+  # no such dependency, so it is safely defaulted here.
+  defp resolve_tracker_provider("bindle", settings, provider) do
+    bindle_provider = Map.put_new(provider, "bindle_bin", @bindle_default_bin)
+
+    {settings.tracker.api_key, settings.tracker.assignee, bindle_provider, []}
   end
 
   defp resolve_tracker_provider(_effective_kind, settings, provider) do

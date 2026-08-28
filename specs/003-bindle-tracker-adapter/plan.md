@@ -46,9 +46,13 @@ and no milestone-acceptance, evidence, or dependency-graph capability is added a
 
 **Language/Version**: Elixir `~> 1.19` (OTP 28), via `mise` — unchanged.
 
-**Primary Dependencies**: `exqlite ~> 0.30` (already present in `mix.lock`, resolving `0.40.0` — reused,
-not re-added, for read-only SQLite access to the published projection). No other new dependency; the
-Bindle CLI is invoked via `System.cmd/3`, no HTTP/JSON client needed (the CLI has no JSON output mode).
+**Primary Dependencies**: `exqlite ~> 0.30` for read-only SQLite access to the published projection.
+**Correction (implementation-stage)**: every prior draft of this document asserted `exqlite` was "already
+present in `mix.lock`" — verified directly against `elixir/mix.exs`/`mix.lock` during implementation that
+this was never true; it was added here as a new dependency (resolves to `0.40.0`, the version already
+assumed throughout this feature's artifacts), via its low-level `Exqlite.Sqlite3` API, not the Ecto
+adapter. No other new dependency; the Bindle CLI is invoked via `System.cmd/3`, no HTTP/JSON client needed
+(the CLI has no JSON output mode).
 
 **Storage**: Reads only Bindle's externally-published, read-only `symphony-projection.sqlite3` (via
 `exqlite`, opened with a read-only URI). The orchestrator-owned claim/release seam writes only through the
@@ -178,9 +182,13 @@ does not introduce a new exception beyond what that frozen spec already accepted
 Re-evaluated against `research.md`, `data-model.md`, and `contracts/bindle-tracker-adapter.md` as actually
 written.
 
-- research.md confirms `exqlite` (already a project dependency) supports SQLite's `mode=ro` read-only URI
-  connection mode directly — no new dependency and no workaround needed to satisfy FR-002's read-only
-  requirement. **I/II/V still PASS.**
+- research.md confirms `exqlite` supports SQLite's `mode: :readonly` open flag directly (`Exqlite.Sqlite3.open/2`)
+  — no workaround needed to satisfy FR-002's read-only requirement. It is a new dependency, not an
+  already-present one (corrected above, Technical Context) — a small, justified addition given no SQLite
+  library existed in this project before this feature. **I/II/V still PASS**: II's "minimize fork delta"
+  is about shared orchestration code, not dependency count, and V's "avoid unnecessary abstraction" is
+  satisfied since `exqlite`'s low-level `Sqlite3` API is used directly with no Ecto Repo/migration
+  machinery added on top of it.
 - data-model.md's Owner Identity (§5) and Startup Reconciliation (§6) are confirmed as the minimum new
   state needed — a single persisted string and a stateless, blind projection-enumeration release sweep,
   not a new subsystem or a local ledger. **V still PASS**, and more cleanly than the Constitution Check
@@ -233,7 +241,7 @@ elixir/
 ├── lib/symphony_elixir/
 │   ├── tracker.ex                    # MODIFIED: +acquire_issue/2, +release_issue(issue_id, opts) (@optional_callbacks)
 │   ├── tracker/issue.ex              # MODIFIED: split routable?/2 into dispatchable?/1 + routed?/2;
-│   │                                 #   +routed_by_assignment field (default true)
+│   │                                 #   +continuation_allowed field (default true)
 │   ├── orchestrator.ex               # MODIFIED: call acquire_issue/2 before spawn, only in fresh-admission
 │   │                                 #   mode (issue not already in state.claimed, FR-016/FR-024) — a
 │   │                                 #   continuation retry of an issue already in state.claimed skips

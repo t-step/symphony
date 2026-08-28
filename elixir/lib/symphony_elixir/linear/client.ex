@@ -482,6 +482,10 @@ defmodule SymphonyElixir.Linear.Client do
         blocked_by: blockers,
         labels: extract_labels(issue),
         dispatchable: dispatchable?(state_name, blockers, assignee, assignee_filter),
+        # Surfaces the same still-assigned-to-this-worker computation dispatchable/1 already folds
+        # in, as its own field — this is what preserves Linear's real reassignment-stop continuation
+        # behavior once dispatchable itself is no longer consulted for continuation (FR-013/FR-017).
+        continuation_allowed: assigned_to_worker?(assignee, assignee_filter),
         created_at: parse_datetime(issue["createdAt"]),
         updated_at: parse_datetime(issue["updatedAt"])
       }

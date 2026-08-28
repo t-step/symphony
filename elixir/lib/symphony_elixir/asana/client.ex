@@ -221,6 +221,11 @@ defmodule SymphonyElixir.Asana.Client do
         labels: extract_labels(task["tags"]),
         blocked_by: [],
         dispatchable: task["completed"] == false and task["resource_subtype"] != "section",
+        # Independent of section/state (`state`, above, comes solely from `memberships.section.name`):
+        # a task can flip `completed: true` while its section stays unchanged, so continuation must
+        # consult `completed` directly rather than relying on label/state match alone to catch it
+        # (FR-013/FR-017 — this is the previously-open completed-vs-section-name gap, now closed).
+        continuation_allowed: task["completed"] == false,
         created_at: parse_datetime(task["created_at"]),
         updated_at: parse_datetime(task["modified_at"])
       }

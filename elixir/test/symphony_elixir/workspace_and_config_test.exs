@@ -538,6 +538,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.dispatchable
   end
 
+  test "linear client populates continuation_allowed from the same still-assigned-to-this-worker computation as dispatchable (FR-013/FR-017)" do
+    still_assigned = %{
+      "id" => "issue-100",
+      "identifier" => "MT-100",
+      "title" => "Still mine",
+      "state" => %{"name" => "In Progress"},
+      "assignee" => %{"id" => "user-1"}
+    }
+
+    reassigned = %{still_assigned | "id" => "issue-101", "assignee" => %{"id" => "user-2"}}
+
+    assert Client.normalize_issue_for_test(still_assigned, "user-1").continuation_allowed == true
+    assert Client.normalize_issue_for_test(reassigned, "user-1").continuation_allowed == false
+
+    # No configured assignee filter (nil) means "no assignment concept blocks continuation" —
+    # continuation_allowed stays true regardless of who is actually assigned.
+    assert Client.normalize_issue_for_test(reassigned, nil).continuation_allowed == true
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},

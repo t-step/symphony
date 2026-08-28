@@ -832,6 +832,9 @@ defmodule SymphonyElixir.CoreTest do
       retry_attempts: %{}
     }
 
+    # Reassignment-away is now carried as `continuation_allowed: false` (the provider-neutral
+    # continuation signal Linear's client populates), not `dispatchable: false` — dispatchable is
+    # purely an admission fact and must not gate continuation (FR-013/FR-014/FR-017).
     issue = %Issue{
       id: issue_id,
       identifier: "MT-561",
@@ -839,7 +842,8 @@ defmodule SymphonyElixir.CoreTest do
       title: "Reassigned active issue",
       description: "Worker should stop",
       labels: [],
-      dispatchable: false
+      dispatchable: false,
+      continuation_allowed: false
     }
 
     updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
@@ -896,6 +900,54 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "reconcile does not stop a running issue solely because dispatchable flips to false (FR-014/FR-017, SC-003)" do
+    issue_id = "issue-just-claimed"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-562",
+          issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress", dispatchable: true},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    # A durable-claim-aware tracker (e.g. Bindle) honestly reports `dispatchable: false` the moment
+    # Symphony's own acquisition succeeds — active state and routing are both unchanged, so
+    # reconciliation MUST NOT terminate the agent or release the claim on `dispatchable` alone.
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562",
+      state: "In Progress",
+      title: "Just claimed by us",
+      description: "Should keep running",
+      labels: [],
+      dispatchable: false,
+      continuation_allowed: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+
+    send(agent_pid, :stop)
+  end
+
   test "reconcile releases a blocked issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 
@@ -925,6 +977,37 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(updated_state.blocked, issue_id)
     refute MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "reconcile does not release a blocked issue solely because dispatchable flips to false (FR-014/FR-017, SC-003)" do
+    issue_id = "blocked-just-claimed"
+
+    state = %Orchestrator.State{
+      blocked: %{
+        issue_id => %{
+          identifier: "MT-567",
+          error: "operator input required",
+          worker_host: nil
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-567",
+      title: "Blocked but still claimed by us",
+      state: "In Progress",
+      labels: [],
+      dispatchable: false,
+      continuation_allowed: true
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.blocked, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
   end
 
   test "retry releases its claim when a required label is removed" do
@@ -1019,6 +1102,24 @@ defmodule SymphonyElixir.CoreTest do
     fetcher = fn ["issue-label-continuation"] -> {:ok, [refreshed_issue]} end
 
     assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
+  test "agent runner continues a multi-turn run when dispatchable flips to false but routing is unchanged (FR-015/FR-017, SC-003)" do
+    issue = %Issue{
+      id: "issue-continue-despite-claim",
+      identifier: "MT-568",
+      title: "Continue despite dispatchable flip",
+      state: "In Progress",
+      labels: [],
+      dispatchable: true,
+      continuation_allowed: true
+    }
+
+    refreshed_issue = %{issue | dispatchable: false}
+    fetcher = fn ["issue-continue-despite-claim"] -> {:ok, [refreshed_issue]} end
+
+    assert {:continue, ^refreshed_issue} =
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 

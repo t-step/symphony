@@ -142,6 +142,23 @@ defmodule SymphonyElixir.Asana.AdapterTest do
            ) == nil
   end
 
+  test "client populates continuation_allowed from task[\"completed\"], independent of section/state (FR-013/FR-017, SC-010)" do
+    open_task = AsanaClient.normalize_issue_for_test(raw_task("50"), tracker_settings())
+    assert open_task.continuation_allowed == true
+    assert open_task.state == "Todo"
+
+    # The completed-vs-section-name gap: a task completes without its section changing — `state`
+    # stays "Todo" (unchanged), but continuation_allowed must independently flip to false.
+    completed_but_same_section =
+      AsanaClient.normalize_issue_for_test(Map.put(raw_task("51"), "completed", true), tracker_settings())
+
+    assert completed_but_same_section.state == "Todo"
+    assert completed_but_same_section.continuation_allowed == false
+
+    still_open = AsanaClient.normalize_issue_for_test(Map.put(raw_task("52"), "completed", false), tracker_settings())
+    assert still_open.continuation_allowed == true
+  end
+
   test "client pages state reads, filters requested sections, and drops malformed records" do
     first_page = [raw_task("1"), raw_task("2"), Map.put(raw_task("3"), "name", "")]
     second_page = [task_in_section("4", "Done", "section-done")]

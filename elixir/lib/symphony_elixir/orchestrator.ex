@@ -7,11 +7,12 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Bindle, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @max_stale_claim_release_attempts 3
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,6 +40,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      stale_claim_release_retries: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -70,9 +72,15 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
         run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
 
-        {:ok, state}
+        case reconcile_stale_claims(state) do
+          {:ok, state} ->
+            state = schedule_tick(state, 0)
+            {:ok, state}
+
+          {:stop, reason} ->
+            {:stop, reason}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -199,6 +207,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
+
+  # Dedicated stale-claim-release retry mechanism (FR-029) — deliberately separate from
+  # {:retry_issue, ...}/state.retry_attempts (see reconcile_stale_claims/1's own comment for why).
+  # Never re-enters Tracker.fetch_issues_by_ids/1 or do_dispatch_issue/4 — calls only
+  # bindle_cli_module().release/4.
+  def handle_info({:retry_stale_claim_release, issue_id, retry_token, repo_path, bindle_bin, owner, attempt}, state) do
+    case Map.get(state.stale_claim_release_retries, issue_id) do
+      %{retry_token: ^retry_token} ->
+        state = %{state | stale_claim_release_retries: Map.delete(state.stale_claim_release_retries, issue_id)}
+
+        case bindle_cli_module().release(repo_path, bindle_bin, issue_id, owner) do
+          {:ok, _output} ->
+            {:noreply, state}
+
+          {:error, reason} ->
+            Logger.warning("Stale-claim release retry failed issue_id=#{issue_id} attempt=#{attempt}: #{inspect(reason)}")
+
+            {:noreply, schedule_stale_claim_release_retry(state, issue_id, attempt + 1, repo_path, bindle_bin, owner)}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
 
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
@@ -388,11 +420,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
+  @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term()), boolean()) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
-  def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
+  def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher, claimed? \\ false)
       when is_function(issue_fetcher, 1) do
-    revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+    revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set(), claimed?)
   end
 
   @doc false
@@ -405,6 +437,18 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec spawn_issue_on_worker_host_for_test(term(), Issue.t(), term(), pid(), String.t() | nil) :: term()
+  def spawn_issue_on_worker_host_for_test(%State{} = state, %Issue{} = issue, attempt, recipient, worker_host) do
+    spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+  end
+
+  @doc false
+  @spec reconcile_stale_claims_for_test(term()) :: {:ok, term()} | {:stop, term()}
+  def reconcile_stale_claims_for_test(%State{} = state) do
+    reconcile_stale_claims(state)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -425,7 +469,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) ->
+      !issue_routed?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
@@ -460,7 +504,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
-      !issue_routable?(issue) ->
+      !issue_routed?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
@@ -565,13 +609,11 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
         end
 
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
+        # Delegates its claimed/blocked/retry_attempts clearing to release_issue_claim/2 (FR-020/
+        # FR-021) instead of duplicating that logic inline, so Tracker.release_issue/2 fires from
+        # exactly the one call site — never a second, independent external release call here.
+        %{state | running: Map.delete(state.running, issue_id)}
+        |> release_issue_claim(issue_id)
 
       _ ->
         release_issue_claim(state, issue_id)
@@ -880,6 +922,10 @@ defmodule SymphonyElixir.Orchestrator do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
+  defp issue_routed?(%Issue{} = issue) do
+    Issue.routed?(issue, Config.settings!().tracker.required_labels)
+  end
+
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
   end
@@ -912,7 +958,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case refresh_issue_for_dispatch(issue) do
+    case refresh_issue_for_dispatch(issue, MapSet.member?(state.claimed, issue.id)) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
@@ -924,8 +970,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp refresh_issue_for_dispatch(issue) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issues_by_ids/1, terminal_state_set()) do
+  defp refresh_issue_for_dispatch(issue, claimed?) do
+    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issues_by_ids/1, terminal_state_set(), claimed?) do
       {:ok, %Issue{} = refreshed_issue} ->
         {:ok, refreshed_issue}
 
@@ -957,7 +1003,31 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Fresh-admission vs. continuation-retry (FR-016/FR-024, research.md R16): this call site is shared
+  # by both the fresh-dispatch path (`dispatch_issue/4`) and the retry-continuation path
+  # (`handle_active_retry/4`). `acquire_issue/2` is called only when `issue.id` is not already present
+  # in `state.claimed` (fresh admission, including a fresh-admission retry following the
+  # spawn-failure compensation below). For a continuation retry of an issue already in `state.claimed`
+  # (a prior worker for it actually started), `acquire_issue/2` MUST NOT be called again — Bindle
+  # rejects a second `claim()` against an already-claimed task even from the same owner
+  # (`work_item_claims`' primary key is `work_item_id` alone) — the retry proceeds directly to
+  # respawning, reusing the already-held claim.
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    if MapSet.member?(state.claimed, issue.id) do
+      do_spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+    else
+      case Tracker.acquire_issue(issue) do
+        :ok ->
+          do_spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, true)
+
+        other ->
+          Logger.debug("Skipping dispatch; acquisition unavailable for #{issue_context(issue)}: #{inspect(other)}")
+          state
+      end
+    end
+  end
+
+  defp do_spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, acquired?) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -1001,6 +1071,17 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
+        # Acquire-success / spawn-failure compensation (FR-008, research.md R12): if acquisition
+        # actually succeeded for this attempt (`acquired?`) but the worker itself never started, no
+        # workspace/attempt exists to reuse — release the just-acquired claim as compensation before
+        # scheduling the ordinary spawn-failure retry, otherwise that retry's own next
+        # `acquire_issue/2` attempt would be rejected by Bindle as already-claimed by this same
+        # owner, deadlocking the issue against itself. This is distinct from the ordinary
+        # crash-mid-run retry case, where a worker already started and the claim is intentionally
+        # retained (FR-007) — this branch only fires when `acquired?` is true, i.e. this was a
+        # fresh-admission attempt whose spawn itself failed before any workspace existed.
+        state = if acquired?, do: release_issue_claim(state, issue.id), else: state
+
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           issue_url: issue.url,
@@ -1010,11 +1091,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
+  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states, claimed?)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
+        if dispatch_revalidation_candidate?(refreshed_issue, terminal_states, claimed?) do
           {:ok, refreshed_issue}
         else
           {:skip, refreshed_issue}
@@ -1028,7 +1109,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states, _claimed?), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1127,7 +1208,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, metadata)
         {:noreply, release_issue_claim(state, issue_id)}
 
-      retry_candidate_issue?(issue, terminal_states) ->
+      dispatch_revalidation_candidate?(issue, terminal_states, MapSet.member?(state.claimed, issue_id)) ->
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
@@ -1181,15 +1262,109 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Startup-time stale-claim reconciliation (FR-012/FR-029, data-model.md §6, research.md R5/R19).
+  # Runs once, synchronously, in init/1 before the first poll is scheduled — mirroring
+  # run_terminal_workspace_cleanup/0's existing synchronous-startup-step pattern — only when
+  # tracker.kind: bindle is active. A blind, projection-wide, owner-scoped release sweep; an
+  # individual release failure does not abort the sweep for the remaining ids and gets bounded
+  # follow-up retries via a *dedicated* timer/message (schedule_stale_claim_release_retry/6,
+  # state.stale_claim_release_retries, {:retry_stale_claim_release, ...}) — deliberately NOT
+  # schedule_issue_retry/4 or state.retry_attempts, which are coding-agent-dispatch-specific
+  # machinery (their retry_attempts entries carry identifier/issue_url/worker_host/workspace_path
+  # fields that do not apply here, and their {:retry_issue, ...} handler re-enters the ordinary
+  # issue fetch/dispatch state machine) — a stale-claim-release failure must never accidentally
+  # enter that machinery. Only a corrupt/empty owner identity fails startup outright ({:stop, _});
+  # a projection read/schema-version failure is surfaced the same distinguishable way an ordinary
+  # poll failure would be (logged, startup proceeds, normal polling's own tracker/source failure
+  # handling takes over).
+  defp reconcile_stale_claims(%State{} = state) do
+    if Config.structural_settings!().tracker_kind == "bindle" do
+      provider = Config.settings!().tracker.provider
+      repo_path = Bindle.Adapter.resolve_repo_path(provider)
+      bindle_bin = Bindle.Adapter.resolve_bindle_bin(provider)
+      owner_id_path = Bindle.Adapter.resolve_owner_id_path(provider)
+      projection_path = Bindle.Adapter.resolve_projection_path(provider)
+
+      case Bindle.Owner.id(owner_id_path) do
+        {:ok, owner} ->
+          {:ok, sweep_stale_claims(state, repo_path, bindle_bin, owner, projection_path)}
+
+        {:error, reason} ->
+          {:stop, {:bindle_owner_identity_failed, reason}}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp sweep_stale_claims(state, repo_path, bindle_bin, owner, projection_path) do
+    case Bindle.Projection.list_ids(projection_path) do
+      {:ok, ids} ->
+        Enum.reduce(ids, state, &release_stale_claim(&1, &2, repo_path, bindle_bin, owner))
+
+      {:error, reason} ->
+        Logger.error("Startup stale-claim reconciliation could not read the Bindle projection: #{inspect(reason)}; normal polling will retry once the projection becomes available")
+
+        state
+    end
+  end
+
+  defp release_stale_claim(issue_id, state, repo_path, bindle_bin, owner) do
+    case bindle_cli_module().release(repo_path, bindle_bin, issue_id, owner) do
+      {:ok, _output} ->
+        state
+
+      {:error, reason} ->
+        Logger.warning("Startup stale-claim release failed issue_id=#{issue_id}: #{inspect(reason)}; scheduling a bounded follow-up retry")
+
+        schedule_stale_claim_release_retry(state, issue_id, 1, repo_path, bindle_bin, owner)
+    end
+  end
+
+  defp schedule_stale_claim_release_retry(%State{} = state, issue_id, attempt, repo_path, bindle_bin, owner) do
+    if attempt > @max_stale_claim_release_attempts do
+      Logger.error("Startup stale-claim reconciliation exhausted its retry budget for issue_id=#{issue_id}; this claim may require manual operator intervention (bindle work release)")
+
+      %{state | stale_claim_release_retries: Map.delete(state.stale_claim_release_retries, issue_id)}
+    else
+      old_timer = get_in(state.stale_claim_release_retries, [issue_id, :timer_ref])
+
+      if is_reference(old_timer) do
+        Process.cancel_timer(old_timer)
+      end
+
+      retry_token = make_ref()
+      delay_ms = failure_retry_delay(attempt)
+
+      timer_ref =
+        Process.send_after(
+          self(),
+          {:retry_stale_claim_release, issue_id, retry_token, repo_path, bindle_bin, owner, attempt},
+          delay_ms
+        )
+
+      %{
+        state
+        | stale_claim_release_retries: Map.put(state.stale_claim_release_retries, issue_id, %{attempt: attempt, timer_ref: timer_ref, retry_token: retry_token})
+      }
+    end
+  end
+
+  defp bindle_cli_module do
+    Application.get_env(:symphony_elixir, :bindle_cli_module, Bindle.Cli)
+  end
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
+    claimed? = MapSet.member?(state.claimed, issue.id)
+
+    if dispatch_revalidation_candidate?(issue, terminal_state_set(), claimed?) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      case refresh_issue_for_dispatch(issue) do
+      case refresh_issue_for_dispatch(issue, claimed?) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
 
@@ -1227,7 +1402,16 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # The single internal call site `Tracker.release_issue/2` is invoked from (FR-021, contracts §2) —
+  # reached by every release path in this module (`terminate_running_issue/3`'s three branches,
+  # `reconcile_blocked_issue_state/4`'s direct calls, `handle_retry_issue_lookup/5`,
+  # `handle_active_retry/4`) — so a single logical termination/release event never fires the external
+  # `bindle work release` call more than once. A complete no-op for every adapter that does not
+  # implement `release_issue/2` (FR-005), and safe to call even for an issue this deployment never
+  # actually acquired (Bindle's own release is a documented no-op for an unheld/unclaimed task).
   defp release_issue_claim(%State{} = state, issue_id) do
+    Tracker.release_issue(issue_id)
+
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
@@ -1648,6 +1832,29 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states)
+  end
+
+  # Fresh-admission vs. continuation-retry (FR-016/FR-024, research.md R16). Both
+  # `handle_retry_issue_lookup/5`'s own candidacy check and `revalidate_issue_for_dispatch/4` (reached
+  # by both `dispatch_issue/4`'s fresh path and `handle_active_retry/4`'s retry path via
+  # `refresh_issue_for_dispatch/2`) share this one predicate so the split lives in exactly one place.
+  #
+  # Fresh admission (`claimed?: false` — the issue is not already in `state.claimed`, i.e. a first
+  # dispatch attempt or a retry following FR-008's spawn-failure-compensation release) continues to
+  # require `dispatchable = true`, exactly as today (`retry_candidate_issue?/2`, unchanged).
+  #
+  # Continuation retry (`claimed?: true` — a prior worker for this issue actually started and its
+  # claim is intentionally retained, FR-007) MUST NOT require `dispatchable = true` — a claimed
+  # Bindle task's `dispatchable` fact is `false` by construction. It uses only the continuation/
+  # routing concern (`Issue.routed?/2`) plus the same terminal/active checks admission already uses.
+  defp dispatch_revalidation_candidate?(%Issue{} = issue, terminal_states, true) do
+    !terminal_issue_state?(issue.state, terminal_states) and
+      active_issue_state?(issue.state, active_state_set()) and
+      issue_routed?(issue)
+  end
+
+  defp dispatch_revalidation_candidate?(%Issue{} = issue, terminal_states, false) do
+    retry_candidate_issue?(issue, terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
